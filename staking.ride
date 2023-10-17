@@ -15,12 +15,14 @@
 # Константы
 let MULT10 = 1_000_000_000_0
 let SEP = "__"
+let rewardAssetsSEP = "///"
+let nullKey = "NULL"
 
 # Данные пула
 let isConstructedKey = "is_constructed"
 let withdrawalLockPeriodKey = "withdrawal_lock_period"
 
-let rewardAssetIdKey = "reward_asset_id"
+let rewardAssetIdsKey = "reward_asset_ids"
 let poolStakeAssetIdKey = "pool_stake_asset_id"
 let rootContractAddressKey = "root_contract_address"
 let adminAddressKey = "admin_address_key"
@@ -46,18 +48,24 @@ func isUserHaveUnclaimedRewards(address: String) = {
     userLastClaimedRewardsAtPoolClaimId < currentPoolClaimId
 }
 
+# UPD: Пул теперь может принимать награды от 1 до трех наградных токенов.
 @Callable(i)
-func constructor(rewardAssetId: String, poolStakeAssetId: String, withdrawalLockPeriod: Int, rootContract: String, adminContract: String) = {
+func constructor(rewardAsset1Id: String, rewardAsset2Id: String, rewardAsset3Id: String, 
+  poolStakeAssetId: String, withdrawalLockPeriod: Int, rootContract: String, adminContract: String) = {
   if isDefined(getBoolean(isConstructedKey)) then throw("Constructor can be called one time")
   else
+    let rewardAsset1 = if size(rewardAsset1Id) == 0 then nullKey else rewardAsset1Id
+    let rewardAsset2 = if size(rewardAsset2Id) == 0 then nullKey else rewardAsset2Id
+    let rewardAsset3 = if size(rewardAsset3Id) == 0 then nullKey else rewardAsset3Id
+
     [
       BooleanEntry(isConstructedKey, true),
-      IntegerEntry(poolCurrentUnclaimedAdditionalRewardsKey, 0),
-      StringEntry(rewardAssetIdKey, rewardAssetId),
+      StringEntry(poolCurrentUnclaimedAdditionalRewardsKey, makeString(["0","0","0"], rewardAssetsSEP)),
+      StringEntry(rewardAssetIdsKey, makeString([rewardAsset1, rewardAsset2, rewardAsset3], rewardAssetsSEP)),
       StringEntry(poolStakeAssetIdKey, poolStakeAssetId),
       StringEntry(rootContractAddressKey, rootContract),
       StringEntry(adminAddressKey, adminContract),
-      IntegerEntry(totalPoolEarnedKey, 0),
+      StringEntry(totalPoolEarnedKey, makeString(["0","0","0"], rewardAssetsSEP)),
       IntegerEntry(poolCurrentClaimIdKey, 0),
       IntegerEntry(totalPoolStakedKey, 0),
       IntegerEntry(withdrawalLockPeriodKey, withdrawalLockPeriod)
@@ -79,7 +87,7 @@ func stake() = {
       # Текущие данные пула
       let currentPoolClaimId = getIntegerValue(poolCurrentClaimIdKey)
       let currentTotalPoolStaked = getIntegerValue(totalPoolStakedKey)
-      let currentTotalPoolRewardsEarnedForOneStakeToken = getIntegerValue(totalPoolEarnedKey)
+      let currentTotalPoolRewardsEarnedForOneStakeToken = getStringValue(totalPoolEarnedKey)
       let rootContractAddress = getStringValue(rootContractAddressKey)
 
       # Если задан родительский контракт, перебрасываем платеж туда
@@ -103,9 +111,9 @@ func stake() = {
         else
         makeString([
           payment.amount.toString(), # Общее колл-во застейканых токенов пользователем
-          "0", # Общее колл-во склеймленных пользователем токенов с пула
+          makeString(["0", "0", "0"], rewardAssetsSEP), # Общее колл-во склеймленных пользователем токенов с пула 
           currentPoolClaimId.toString(), # Текущий айди клейма пула
-          currentTotalPoolRewardsEarnedForOneStakeToken.toString(), # Текущая пропорция заработка пула (колл-во склеймленных токенов/колл-во застейканых токенов)
+          currentTotalPoolRewardsEarnedForOneStakeToken, # Текущая пропорция заработка пула (колл-во склеймленных токенов/колл-во застейканых токенов)
           height.toString() # Текущий блок
         ], SEP)
 
@@ -116,124 +124,220 @@ func stake() = {
 }
 
 # Вывод LP с контратка, вызывается пользователем
+# UPD: По новым данным от команды Waves Exchange, когда у них адрес делает вывод LP токенов, то они также 
+# рассылают ему текущие награды за стейкинг. В нашем случае адрес - это пул, поэтому перед выводом нужно 
+# обязательно собрать награды пула и вывести долю от них текущему пользователю
 @Callable(i)
 func withdraw(amount: Int) = {
   if amount <= 0 then throw("Amount must be positive") else
   let callerAddress = toBase58String(i.caller.bytes)
-  if isUserHaveUnclaimedRewards(callerAddress) then throw("You have unclaimed rewards on contract, claim them first")
-  else
-    let userData = split(valueOrErrorMessage(getString(callerAddress), "User not found"), SEP)
-    let userTotalStakedAmount = parseIntValue(userData[0])
-    if amount > userTotalStakedAmount then throw("Insufficient funds")
-    else 
-      # Если у пула есть лок период, проверяем возможность вывода
-      let withdrawalLockPeriod = getIntegerValue(withdrawalLockPeriodKey)
-      let userLastStakeBlock = parseIntValue(userData[4])
-      if withdrawalLockPeriod > 0 && (height - userLastStakeBlock) < withdrawalLockPeriod then
-        throw("This pool have lock period. You need to wait " + (withdrawalLockPeriod - (height - userLastStakeBlock)).toString() + " blocks") 
-      else
-        let rootContractAddress = getStringValue(rootContractAddressKey)
-        let currentTotalPoolStaked = valueOrElse(getInteger(totalPoolStakedKey), 0)
-        let poolStakeAssetId = getStringValue(poolStakeAssetIdKey)
+  let userData = split(valueOrErrorMessage(getString(callerAddress), "User not found"), SEP)
+  let userTotalStakedAmount = parseIntValue(userData[0])
+  if amount > userTotalStakedAmount then throw("Insufficient funds")
+  else 
+    # Если у пула есть лок период, проверяем возможность вывода
+    let withdrawalLockPeriod = getIntegerValue(withdrawalLockPeriodKey)
+    let userLastStakeBlock = parseIntValue(userData[4])
+    if withdrawalLockPeriod > 0 && (height - userLastStakeBlock) < withdrawalLockPeriod then
+      throw("This pool have lock period. You need to wait " + (withdrawalLockPeriod - (height - userLastStakeBlock)).toString() + " blocks") 
+    else
+      strict claimPoolRewardsResult = invoke(this, "claimPoolRewards", [], [])
+      strict userClaimRewardsResult = if isUserHaveUnclaimedRewards(callerAddress) then 
+        invoke(this, "claimRewards", [], []) else unit
 
-        # Если задан родительский контракт, сначала выводим с него токены
-        strict result = if size(rootContractAddress) > 0 then 
-          invoke(Address(fromBase58String(rootContractAddress)), "withdrawPoolLps", [amount], [])
-        else unit
+      let rootContractAddress = getStringValue(rootContractAddressKey)
+      let currentTotalPoolStaked = valueOrElse(getInteger(totalPoolStakedKey), 0)
+      let poolStakeAssetId = getStringValue(poolStakeAssetIdKey)
 
-        # Обновляем данные пользователя
-        let newUserData = cons((userTotalStakedAmount - amount).toString(), removeByIndex(userData, 0))
+      # Если задан родительский контракт, сначала выводим с него токены
+      strict result = if size(rootContractAddress) > 0 then 
+        invoke(Address(fromBase58String(rootContractAddress)), "withdrawPoolLps", [amount], [])
+      else unit
 
-        [
-          IntegerEntry(totalPoolStakedKey, currentTotalPoolStaked - amount),
-          ScriptTransfer(Address(i.caller.bytes), amount, fromBase58String(poolStakeAssetId))
-        ] :+ if userTotalStakedAmount - amount == 0 then DeleteEntry(callerAddress)
-        else StringEntry(callerAddress, makeString(newUserData, SEP))
+      # Обновляем данные пользователя
+      let newUserData = cons((userTotalStakedAmount - amount).toString(), removeByIndex(userData, 0))
+      [
+        IntegerEntry(totalPoolStakedKey, currentTotalPoolStaked - amount),
+        ScriptTransfer(Address(i.caller.bytes), amount, fromBase58String(poolStakeAssetId))
+      ] :+ if userTotalStakedAmount - amount == 0 then DeleteEntry(callerAddress)
+      else StringEntry(callerAddress, makeString(newUserData, SEP))
 }
 
 # Клейм ревардов, вызывается пользователем
 @Callable(i)
 func claimRewards() = {
-  let callerAddress = toBase58String(i.caller.bytes)
+  let callerAddress = toBase58String(i.originCaller.bytes)
   if !isUserHaveUnclaimedRewards(callerAddress) then 
     throw("Nothing to claim, or user not found")
   else
     let poolCurrentClaimId = getIntegerValue(poolCurrentClaimIdKey)
-    let totalPoolEarnedRewardsForOneStakeToken = getIntegerValue(totalPoolEarnedKey)
+    let totalPoolEarnedRewardsForOneStakeToken = split(getStringValue(totalPoolEarnedKey), rewardAssetsSEP)
 
+    # Парсим данные по пользователю
     let userData = split(getStringValue(callerAddress), SEP)
     let userTotalStaked = parseIntValue(userData[0])
-    let userTotalRewardsClaimed = parseIntValue(userData[1])
+    let userTotalRewardsClaimed = split(userData[1], rewardAssetsSEP)
     let userLastClaimPoolClaimId = parseIntValue(userData[2])
-    let userAlreadyClaimedRewardsForOneStakeToken = parseIntValue(userData[3])
+  
+    let userAlreadyClaimedRewardsForOneStakeToken = split(userData[3], rewardAssetsSEP)
+    let userAlreadyClaimedRewardsAsset1ForOneStateToken = parseIntValue(userAlreadyClaimedRewardsForOneStakeToken[0])
+    let userAlreadyClaimedRewardsAsset2ForOneStateToken = parseIntValue(userAlreadyClaimedRewardsForOneStakeToken[1])
+    let userAlreadyClaimedRewardsAsset3ForOneStateToken = parseIntValue(userAlreadyClaimedRewardsForOneStakeToken[2])
 
     # Вычисляем пропорцию ревардов, которую не склеймил пользователь
-    let userUnclaimedPoolEarningsForOneStakeToken = 
-      totalPoolEarnedRewardsForOneStakeToken - userAlreadyClaimedRewardsForOneStakeToken
+    let userUnclaimedPoolEarningsAsset1ForOneStakeToken = 
+      parseIntValue(totalPoolEarnedRewardsForOneStakeToken[0]) - userAlreadyClaimedRewardsAsset1ForOneStateToken
+    let userUnclaimedPoolEarningsAsset2ForOneStakeToken = 
+      parseIntValue(totalPoolEarnedRewardsForOneStakeToken[1]) - userAlreadyClaimedRewardsAsset2ForOneStateToken
+    let userUnclaimedPoolEarningsAsset3ForOneStakeToken = 
+      parseIntValue(totalPoolEarnedRewardsForOneStakeToken[2]) - userAlreadyClaimedRewardsAsset3ForOneStateToken
+    
     # Вычисляем колл-во полагающихся ему токенов исходя из этой пропорции
-    let userClaim = fraction(userUnclaimedPoolEarningsForOneStakeToken, userTotalStaked, MULT10)
-  
+    let userClaimAsset1 = if userUnclaimedPoolEarningsAsset1ForOneStakeToken == 0 then 0 
+      else fraction(userUnclaimedPoolEarningsAsset1ForOneStakeToken, userTotalStaked, MULT10)
+    let userClaimAsset2 = if userUnclaimedPoolEarningsAsset2ForOneStakeToken == 0 then 0
+      else fraction(userUnclaimedPoolEarningsAsset2ForOneStakeToken, userTotalStaked, MULT10)
+    let userClaimAsset3 = if userUnclaimedPoolEarningsAsset3ForOneStakeToken == 0 then 0 
+      else fraction(userUnclaimedPoolEarningsAsset3ForOneStakeToken, userTotalStaked, MULT10)
+
+    let newUserTotalRewardsClaimed = makeString([
+      (parseIntValue(userTotalRewardsClaimed[0]) + userClaimAsset1).toString(),
+      (parseIntValue(userTotalRewardsClaimed[1]) + userClaimAsset2).toString(),
+      (parseIntValue(userTotalRewardsClaimed[2]) + userClaimAsset3).toString()
+    ], rewardAssetsSEP)
+
+    let newUserAlreadyClaimedRewardsForOneStakeToken = makeString([
+      (userAlreadyClaimedRewardsAsset1ForOneStateToken + userUnclaimedPoolEarningsAsset1ForOneStakeToken).toString(),
+      (userAlreadyClaimedRewardsAsset2ForOneStateToken + userUnclaimedPoolEarningsAsset2ForOneStakeToken).toString(),
+      (userAlreadyClaimedRewardsAsset3ForOneStateToken + userUnclaimedPoolEarningsAsset3ForOneStakeToken).toString()
+    ], rewardAssetsSEP)
+
     let newUserData = makeString([
           userData[0], # Общее колл-во застейканых токенов пользователем
-          (userTotalRewardsClaimed + userClaim).toString(), # Общее колл-во склеймленных пользователем токенов с пула
+          newUserTotalRewardsClaimed, # Общее колл-во склеймленных пользователем токенов с пула
           poolCurrentClaimId.toString(), # Айди клейма пула, при котором пользователь сделал последний клейм
-          (userAlreadyClaimedRewardsForOneStakeToken + userUnclaimedPoolEarningsForOneStakeToken).toString(), # Обновленная пропорция с учетом клейма
+          newUserAlreadyClaimedRewardsForOneStakeToken, # Обновленная пропорция с учетом клейма
           userData[4]
         ], SEP)
     
-    let rewardAssetId = fromBase58String(getStringValue(rewardAssetIdKey))
+    let rewardAssetIds = split(getStringValue(rewardAssetIdsKey), rewardAssetsSEP)
+    
+    let initialResult = [StringEntry(callerAddress, newUserData)]
+    let resultAfterAsset1Process = if rewardAssetIds[0] != nullKey && userClaimAsset1 > 0 
+      then initialResult :+ ScriptTransfer(i.caller, userClaimAsset1, fromBase58String(rewardAssetIds[0]))
+      else initialResult
+    let resultAfterAsset2Process = if rewardAssetIds[1] != nullKey && userClaimAsset2 > 0
+      then resultAfterAsset1Process :+ ScriptTransfer(i.caller, userClaimAsset2, fromBase58String(rewardAssetIds[1]))
+      else resultAfterAsset1Process
 
-    [
-      StringEntry(callerAddress, newUserData),
-      ScriptTransfer(i.caller, userClaim, rewardAssetId)
-    ]
+    if rewardAssetIds[2] != nullKey && userClaimAsset3 > 0 
+      then resultAfterAsset2Process :+ ScriptTransfer(i.caller, userClaimAsset3, fromBase58String(rewardAssetIds[2]))
+      else resultAfterAsset2Process
 }
 
-# Клейм ревардов с WX контракта через родительский контракт на этот контракт, вызывается ТОЛЬКО раннером
+# Клейм ревардов с WX контракта через родительский(main) контракт на этот контракт, вызывается ТОЛЬКО раннером
 @Callable(i)
 func claimPoolRewards() = {
-  if i.caller.bytes != fromBase58String(getStringValue(adminAddressKey)) then throw("Admin only") else
+  if i.caller.bytes != fromBase58String(getStringValue(adminAddressKey)) && i.caller != this 
+  then throw("Admin or this contract only") else
   let totalPoolStaked = getIntegerValue(totalPoolStakedKey)
-  let totalPoolEarned = getIntegerValue(totalPoolEarnedKey)
+  let totalPoolEarned = split(getStringValue(totalPoolEarnedKey), rewardAssetsSEP)
   let poolCurrentClaimId = getIntegerValue(poolCurrentClaimIdKey)
-  let rewardAssetId = fromBase58String(getStringValue(rewardAssetIdKey))
+  let rewardAssetIds = split(getStringValue(rewardAssetIdsKey), rewardAssetsSEP)
   let rootContractAddress = getStringValue(rootContractAddressKey)
 
-  strict currentRewardOnContract = assetBalance(this, rewardAssetId)
+  # Текущие балансы (по трем ревардным ассетам)
+  strict currentRewardOnContractAsset1 = if rewardAssetIds[0] == nullKey then 0
+    else  assetBalance(this, fromBase58String(rewardAssetIds[0]))
+  strict currentRewardOnContractAsset2 = if rewardAssetIds[1] == nullKey then 0
+    else  assetBalance(this, fromBase58String(rewardAssetIds[1]))
+  strict currentRewardOnContractAsset3 = if rewardAssetIds[2] == nullKey then 0
+    else  assetBalance(this, fromBase58String(rewardAssetIds[2]))
+
   strict rootContractClaim = if size(rootContractAddress) > 0 then
     invoke(Address(fromBase58String(rootContractAddress)), "claimPoolRewards", [], [])
   else unit
-  let newRewardOnContract = assetBalance(this, rewardAssetId)
 
-  let currentAdditionalUnclaimedRewards = getIntegerValue(poolCurrentUnclaimedAdditionalRewardsKey)
-  let claimedRewardAmount = (newRewardOnContract - currentRewardOnContract) + currentAdditionalUnclaimedRewards
+  # Обновленные балансы (по трем ревардным ассетам)
+  let newRewardOnContractAsset1 = if rewardAssetIds[0] == nullKey then 0
+    else  assetBalance(this, fromBase58String(rewardAssetIds[0]))
+  let newRewardOnContractAsset2 = if rewardAssetIds[1] == nullKey then 0
+    else  assetBalance(this, fromBase58String(rewardAssetIds[1]))
+  let newRewardOnContractAsset3 = if rewardAssetIds[2] == nullKey then 0
+    else  assetBalance(this, fromBase58String(rewardAssetIds[2]))
 
-  if claimedRewardAmount == 0 then []
-  else
-    # Вычисляем пропорцию(колл-во наградных токенов на один застейканый токен) за текущий клейм
-    let currentClaimIdEarningsForOneStakeToken = fraction(claimedRewardAmount, MULT10, totalPoolStaked)
+  # Дополнительные не склеймленные награды (по трем ревардным ассетам)
+  let currentAdditionalUnclaimedRewards = split(getStringValue(poolCurrentUnclaimedAdditionalRewardsKey), rewardAssetsSEP)
+  let claimedRewardAmountAsset1 = (newRewardOnContractAsset1 - currentRewardOnContractAsset1) + parseIntValue(currentAdditionalUnclaimedRewards[0])
+  let claimedRewardAmountAsset2 = (newRewardOnContractAsset2 - currentRewardOnContractAsset2) + parseIntValue(currentAdditionalUnclaimedRewards[1])
+  let claimedRewardAmountAsset3 = (newRewardOnContractAsset3 - currentRewardOnContractAsset3) + parseIntValue(currentAdditionalUnclaimedRewards[2])
 
-    [
-      IntegerEntry(poolCurrentClaimIdKey, poolCurrentClaimId + 1),
-      IntegerEntry(totalPoolEarnedKey, totalPoolEarned + currentClaimIdEarningsForOneStakeToken),
-      IntegerEntry(poolCurrentUnclaimedAdditionalRewardsKey, 0)
-    ]
+  # Заработки за текущий период клейма (по трем ассетам)
+  let currentClaimIdEarningsAsset1ForOneStakeToken = if claimedRewardAmountAsset1 > 0 then
+    fraction(claimedRewardAmountAsset1, MULT10, totalPoolStaked) else 0
+  let currentClaimIdEarningsAsset2ForOneStakeToken = if claimedRewardAmountAsset2 > 0 then
+    fraction(claimedRewardAmountAsset2, MULT10, totalPoolStaked) else 0
+  let currentClaimIdEarningsAsset3ForOneStakeToken = if claimedRewardAmountAsset3 > 0 then
+    fraction(claimedRewardAmountAsset3, MULT10, totalPoolStaked) else 0
+  
+  # Обновленные общие заработки пула (по трем ассетам)
+  let newTotalPoolEaned = makeString([
+    (parseIntValue(totalPoolEarned[0]) + currentClaimIdEarningsAsset1ForOneStakeToken).toString(),
+    (parseIntValue(totalPoolEarned[1]) + currentClaimIdEarningsAsset2ForOneStakeToken).toString(),
+    (parseIntValue(totalPoolEarned[2]) + currentClaimIdEarningsAsset3ForOneStakeToken).toString()
+  ], rewardAssetsSEP)
+
+  [
+    IntegerEntry(poolCurrentClaimIdKey, poolCurrentClaimId + 1),
+    StringEntry(totalPoolEarnedKey, newTotalPoolEaned),
+    StringEntry(poolCurrentUnclaimedAdditionalRewardsKey, makeString(["0","0","0"], rewardAssetsSEP))
+  ]
 }
 
-# В нашей экосистеме будет вызываться родительским контрактом, если данный пул это STB стейкинг пул или
+# В нашей экосистеме будет вызываться родительским(main) контрактом, если данный пул это STB стейкинг пул или
 # пул, который на данный момент является получателем доп наград с других пулов
 @Callable(i)
 func receiveAdditionalReward() = {
-  if size(i.payments) != 1 then throw("One Payment expected")
+  if size(i.payments) != 3 then throw("Three Payments expected")
   else
-    let payment = asPayment(getElement(i.payments, 0))
-    let rewardAssetId = fromBase58String(getStringValue(rewardAssetIdKey))
-    if payment.assetId != rewardAssetId || payment.amount <= 0 then throw("Wrong reward asset id or negative amount")
-    else
-      let currentUnclaimedAdditionalRewards = getIntegerValue(poolCurrentUnclaimedAdditionalRewardsKey)
-      [
-        IntegerEntry(poolCurrentUnclaimedAdditionalRewardsKey, currentUnclaimedAdditionalRewards + payment.amount)
-      ]
+    let currentUnclaimedAdditionalRewards = split(getStringValue(poolCurrentUnclaimedAdditionalRewardsKey), rewardAssetsSEP)
+    let rewardAssetIds = split(getStringValue(rewardAssetIdsKey), rewardAssetsSEP)
+
+    let newUnclaimedAdditinalRewardsAsset1 = if rewardAssetIds[0] == nullKey then currentUnclaimedAdditionalRewards[0]
+      else
+        let payment = asPayment(getElement(i.payments, 0))
+        if payment.assetId != unit && payment.amount > 0 && payment.assetId == fromBase58String(rewardAssetIds[0])
+        then (parseIntValue(currentUnclaimedAdditionalRewards[0]) + payment.amount).toString() else currentUnclaimedAdditionalRewards[0]
+
+    let newUnclaimedAdditinalRewardsAsset2 = if rewardAssetIds[1] == nullKey then currentUnclaimedAdditionalRewards[1]
+      else
+        let payment = asPayment(getElement(i.payments, 1))
+        if payment.assetId != unit && payment.amount > 0 && payment.assetId == fromBase58String(rewardAssetIds[1])
+        then (parseIntValue(currentUnclaimedAdditionalRewards[1]) + payment.amount).toString() else currentUnclaimedAdditionalRewards[1]
+
+    let newUnclaimedAdditinalRewardsAsset3 = if rewardAssetIds[2] == nullKey then currentUnclaimedAdditionalRewards[2]
+      else
+        let payment = asPayment(getElement(i.payments, 2))
+        if payment.assetId != unit && payment.amount > 0 && payment.assetId == fromBase58String(rewardAssetIds[2])
+        then (parseIntValue(currentUnclaimedAdditionalRewards[2]) + payment.amount).toString() else currentUnclaimedAdditionalRewards[2]
+    [
+      StringEntry(poolCurrentUnclaimedAdditionalRewardsKey, makeString([
+        newUnclaimedAdditinalRewardsAsset1, newUnclaimedAdditinalRewardsAsset2, newUnclaimedAdditinalRewardsAsset3
+      ], rewardAssetsSEP))
+    ]
+}
+
+@Callable(i)
+func setRewardAssets(rewardAsset1Id: String, rewardAsset2Id: String, rewardAsset3Id: String) = {
+  if i.caller.bytes != fromBase58String(getStringValue(adminAddressKey)) 
+  then throw("Admin only") 
+  else
+    let rewardAsset1 = if size(rewardAsset1Id) == 0 then nullKey else rewardAsset1Id
+    let rewardAsset2 = if size(rewardAsset2Id) == 0 then nullKey else rewardAsset2Id
+    let rewardAsset3 = if size(rewardAsset3Id) == 0 then nullKey else rewardAsset3Id
+    [
+      StringEntry(rewardAssetIdsKey, makeString([rewardAsset1, rewardAsset2, rewardAsset3], rewardAssetsSEP))
+    ]
 }
 
 @Verifier(tx)
