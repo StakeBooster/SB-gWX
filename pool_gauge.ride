@@ -8,6 +8,7 @@
 let MAX_REWARDS = 5 # FOLD<5>
 
 let owner = this.getStringValue( "owner" ).addressFromStringValue()
+let root_contract = this.getStringValue( "root_contract" ).addressFromStringValue()
 let token = this.getStringValue( "token" )
 let rewards = this.getStringValue( "rewards" )
 let rewards_list = rewards.split( "," )
@@ -179,7 +180,8 @@ func update_user( user: String, change: Int ) =
     let new_user_amount = user_amount( user ) + change
     if( new_user_amount < 0 ) then throw( "bad amount: " + ( -change ).toString() + ", available amount: " + user_amount( user ).toString() ) else
     let new_token_amount = token_amount + change
-    if( new_token_amount > asset_balance( token ) ) then throw( "token balance leakage detected: " + new_token_amount.toString() + " > " + asset_balance( token ).toString() ) else
+    # Так как пересылаем средства на основной смарт, то не можем сдесь уже ссылаться на asset_balance
+    # if( new_token_amount > asset_balance( token ) ) then throw( "token balance leakage detected: " + new_token_amount.toString() + " > " + asset_balance( token ).toString() ) else
 
     strict s = sync() # token_amount > 0 at all legal deposit/withdraw calls
 
@@ -238,6 +240,8 @@ func deposit() =
     if( asset_string( payment.assetId ) != token ) then throw( "wrong token: " + asset_string( payment.assetId ) + " != " + token ) else
     if( payment.amount <= 0 ) then throw( "wrong amount, should be positive" ) else
 
+    strict result = invoke(root_contract, "stakePoolLps", [], [payment])
+
     update_user( msg.caller.toString(), payment.amount )
 }
 
@@ -246,6 +250,9 @@ func withdraw( amount: Int ) =
 {
     if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
     if( amount <= 0 ) then throw( "wrong amount, should be positive" ) else
+
+    strict root_contract_claim = invoke(root_contract, "claimPoolRewards", [], [])
+    strict root_contract_withdrawal = invoke(root_contract, "withdrawPoolLps", [amount], [])
 
     update_user( msg.caller.toString(), -amount )
     ++
@@ -258,6 +265,8 @@ func withdraw( amount: Int ) =
 func claim() =
 {
     if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
+
+    strict root_contract_claim = invoke(root_contract, "claimPoolRewards", [], [])
 
     strict s = if( token_amount > 0 ) then sync() else []
 
@@ -332,7 +341,7 @@ func checkpoint() =
 ## ADMIN FUNCTIONS
 
 @Callable( msg )
-func init( _owner: String, _token: String, _rewards: String, _period: Int ) =
+func init( _owner: String, _token: String, _rewards: String, _period: Int, _root_contract: String ) =
 {
     if( this.getString( "token" ).isDefined() ) then throw( "already initialized" ) else
     if( msg.caller != this ) then throw( "self initialization only" ) else
@@ -343,6 +352,7 @@ func init( _owner: String, _token: String, _rewards: String, _period: Int ) =
         StringEntry( "token", checkAsset( _token ) ),
         StringEntry( "rewards", checkRewardsList( _rewards, _token ) ),
         IntegerEntry( "period", _period ),
+        StringEntry( "root_contract", checkAddress( _root_contract ) ),
         BooleanEntry( "is_killed", false )
     ]
 }
