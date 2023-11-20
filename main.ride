@@ -19,7 +19,6 @@ let additionalRewardPoolKey = "additional_reward_pool"
 let additionalRewardPoolFeeKey = "additional_reward_pool_fee"
 let sbtStakePoolKey = "sbt_stake_pool"
 let sbtStakePoolFeeKey = "sbt_stake_pool_fee"
-let sbtStakePoolTotalClaimedKey = "sbt_stake_pool_total_claimed"
 let totalWXLockedKey = "total_wx_locked"
 
 # Данные для наград в SBT токене
@@ -28,6 +27,10 @@ let totalWXLockedKey = "total_wx_locked"
 let initialSBTTokensAmountKey = "initial_SBT_tokens_amount"
 # Сколько изначально решили давать sbt за один ревардный токен
 let baseSBTTokenAmountForOneRewardTokenKey = "base_SBT_token_amount_for_one_reward_token"
+
+# Для трекинга метрик по total claimed wx и sbt по пулам
+func poolTotalSbtClaimedKey(pool: String) = pool + SEP + "total_sbt_claimed"
+func poolTotalWxClaimedKey(pool: String) = pool + SEP + "total_wx_claimed"
 
 func asPayment(v: Any) = match v {
     case p: AttachedPayment => p
@@ -91,13 +94,17 @@ func constructor(adminAddress: String, sbtStakePool: String, initialSBTTokensAmo
   else
     let sbWx = Issue("sbWX", "", 0, 8, true, unit, 0)
     let assetId = sbWx.calculateAssetId()
+
+    let sbtStakePoolChecked = asAddressString(sbtStakePool)
+
     [
       sbWx,
       StringEntry(sbWxAssetIdKey, toBase58String(assetId)),
       StringEntry(adminAddressKey, asAddressString(adminAddress)),
-      StringEntry(sbtStakePoolKey, asAddressString(sbtStakePool)),
+      StringEntry(sbtStakePoolKey, sbtStakePoolChecked),
       IntegerEntry(sbtStakePoolFeeKey, 1400), # 14%
-      IntegerEntry(sbtStakePoolTotalClaimedKey, 0),
+      IntegerEntry(poolTotalSbtClaimedKey(sbtStakePoolChecked), 0),
+      IntegerEntry(poolTotalWxClaimedKey(sbtStakePoolChecked), 0),
       StringEntry(lpPoolsKey, ""),
       StringEntry(additionalRewardPoolKey, ""),
       IntegerEntry(additionalRewardPoolFeeKey, 600), # 6%
@@ -120,7 +127,7 @@ func mintSbWx() = {
       let totalWXLocked = getIntegerValue(totalWXLockedKey)
       let sbWxAssetId = getStringValue(sbWxAssetIdKey)
 
-      strict wavesExchangeInfo = invoke(Address(wavesExchange), "userMaxDurationREADONLY", [], [])
+      strict wavesExchangeInfo = invoke(Address(wavesExchange), "userMaxDurationREADONLY", [toBase58String(this.bytes)], [])
       match wavesExchangeInfo {
         case tuple: (String, Int) => 
             let functionName = tuple._1
@@ -150,11 +157,11 @@ func claimWxStakingRewards() = {
   let claimed = newWxOnContract - currentWxOnContract
   if claimed == 0 then throw("Nothing to claim") else
 
-  let sbtStakePoolTotalClaimed = getIntegerValue(sbtStakePoolTotalClaimedKey)
-
+  let sbtStakePool = getStringValue(sbtStakePoolKey)
+  let sbtStakePoolAddress = addressFromStringValue(sbtStakePool)
   [
-    IntegerEntry(sbtStakePoolTotalClaimedKey, sbtStakePoolTotalClaimed + claimed),
-    ScriptTransfer(addressFromStringValue(getStringValue(sbtStakePoolKey)), claimed, wxAssetId)
+    IntegerEntry(poolTotalWxClaimedKey(sbtStakePool), getIntegerValue(poolTotalWxClaimedKey(sbtStakePool)) + claimed),
+    ScriptTransfer(sbtStakePoolAddress, claimed, wxAssetId)
   ]
 }
 
@@ -171,7 +178,9 @@ func addPool(address: String, wavesExchangePoolAddress: String) = {
       let newPools = if size(lpPools) == 0 then address else lpPools + SEP + address
       [
         StringEntry(lpPoolsKey, newPools), 
-        StringEntry(asAddressString(address), asAddressString(wavesExchangePoolAddress))
+        StringEntry(asAddressString(address), asAddressString(wavesExchangePoolAddress)),
+        IntegerEntry(poolTotalSbtClaimedKey(address), 0),
+        IntegerEntry(poolTotalWxClaimedKey(address), 0)
       ]
 }
 
@@ -270,21 +279,30 @@ func claimPoolRewards(pool: String) = {
 
   # Вычисляем доп награды пулу в SBT токенах
   let sbtRewardAmount = calculateCurrentRewardSBTAmount(claimed)
-  let sbtRewardActions = if sbtRewardAmount == 0 then [] else [ScriptTransfer(poolAddress, sbtRewardAmount, sbtAssetId)]
+  let sbtRewardActions = if sbtRewardAmount == 0 then [] else [
+      ScriptTransfer(poolAddress, sbtRewardAmount, sbtAssetId),
+      IntegerEntry(poolTotalSbtClaimedKey(pool), getIntegerValue(poolTotalSbtClaimedKey(pool)) + sbtRewardAmount)
+    ]
 
   # Вычисляем доп награды SBT стейкинг пулу и пулу, который выставлен как получатель доп наград
-  let sbtStakePool = addressFromStringValue(getStringValue(sbtStakePoolKey))
+  let sbtStakePool = getStringValue(sbtStakePoolKey)
+  let sbtStakePoolAddress = addressFromStringValue(sbtStakePool)
   let sbtStakePoolFee = getIntegerValue(sbtStakePoolFeeKey)
-  let sbtStakePoolTotalClaimed = getIntegerValue(sbtStakePoolTotalClaimedKey)
   let sbtStakePoolAmount = fraction(claimed, sbtStakePoolFee, feeRank, HALFUP)
-  let sbtStakePoolActions = if sbtStakePoolAmount == 0 then [] else [ScriptTransfer(sbtStakePool, sbtStakePoolAmount, wxAssetId)]
+  let sbtStakePoolActions = if sbtStakePoolAmount == 0 then [] else [
+      ScriptTransfer(sbtStakePoolAddress, sbtStakePoolAmount, wxAssetId),
+      IntegerEntry(poolTotalWxClaimedKey(sbtStakePool), getIntegerValue(poolTotalWxClaimedKey(sbtStakePool)) + sbtStakePoolAmount)
+    ]
 
   # Вычисляем колл-во наград для пула, получателя доп наград
   let additionalRewardPool = getStringValue(additionalRewardPoolKey)
   let additionalRewardPoolFree = getIntegerValue(additionalRewardPoolFeeKey)
   let additionalRewardPoolAmount = if size(additionalRewardPool) == 0 then 0
   else if additionalRewardPool != pool then fraction(claimed, additionalRewardPoolFree, feeRank, HALFUP) else 0
-  let additionalRewardsPoolActions = if additionalRewardPoolAmount == 0 then [] else [ScriptTransfer(addressFromStringValue(additionalRewardPool), additionalRewardPoolAmount, wxAssetId)]
+  let additionalRewardsPoolActions = if additionalRewardPoolAmount == 0 then [] else [
+      ScriptTransfer(addressFromStringValue(additionalRewardPool), additionalRewardPoolAmount, wxAssetId),
+      IntegerEntry(poolTotalWxClaimedKey(additionalRewardPool), getIntegerValue(poolTotalWxClaimedKey(additionalRewardPool)) + additionalRewardPoolAmount)
+    ]
 
   # Вычисляем оставшиеся награды для вызывающего пула
   let poolClaimed = claimed - sbtStakePoolAmount - additionalRewardPoolAmount
@@ -297,7 +315,7 @@ func claimPoolRewards(pool: String) = {
   additionalRewardsPoolActions
   ++
   [
-    IntegerEntry(sbtStakePoolTotalClaimedKey, sbtStakePoolTotalClaimed + sbtStakePoolAmount),
-    ScriptTransfer(poolAddress, poolClaimed, wxAssetId)
+    ScriptTransfer(poolAddress, poolClaimed, wxAssetId),
+    IntegerEntry(poolTotalWxClaimedKey(pool), getIntegerValue(poolTotalWxClaimedKey(pool)) + poolClaimed)
   ]
  }
