@@ -1,0 +1,321 @@
+{-# STDLIB_VERSION 6 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+let SEP = "__"
+let feeRank = 10000 # 100%
+let sbtTokenDigits = 100000000
+
+let wxAssetId = base58'Atqv59EYzjFGuitKVnMRk6H8FukjoV3ktPorbEys25on'
+let sbtAssetId = base58'vAYvjoLheNuvi2wRdQYK9NUjJ6ZQ5EkAtx7jy36rK13'
+let wavesExchange = base58'3PJL8Hn8LACaSBWLQ3UVhctA5cTQLBFwBAP'
+let claimWxRewardContract = base58'3PH83bJCZraJoEzFefz4p8UXZD9YazNnj1n'
+
+let isConstructedKey = "is_constructed"
+let adminAddressKey = "admin_address"
+let sbWxAssetIdKey = "sb_wx_asset_id"
+let lpPoolsKey = "lp_pools"
+let additionalRewardPoolKey = "additional_reward_pool"
+let additionalRewardPoolFeeKey = "additional_reward_pool_fee"
+let sbtStakePoolKey = "sbt_stake_pool"
+let sbtStakePoolFeeKey = "sbt_stake_pool_fee"
+let totalWXLockedKey = "total_wx_locked"
+
+# Данные для наград в SBT токене
+
+# Общая изначальная сумма, которую будем распределять, как награды
+let initialSBTTokensAmountKey = "initial_SBT_tokens_amount"
+# Сколько изначально решили давать sbt за один ревардный токен
+let baseSBTTokenAmountForOneRewardTokenKey = "base_SBT_token_amount_for_one_reward_token"
+
+# Для трекинга метрик по total claimed wx и sbt по пулам
+func poolTotalSbtClaimedKey(pool: String) = pool + SEP + "total_sbt_claimed"
+func poolTotalWxClaimedKey(pool: String) = pool + SEP + "total_wx_claimed"
+
+func asPayment(v: Any) = match v {
+    case p: AttachedPayment => p
+    case _ => throw("fail to cast into AttachedPayment")
+}
+
+func asByteVector(v: Any) = match v {
+    case p: ByteVector => p
+    case _ => throw("fail to cast into ByteVector")
+}
+
+func asInt(val: Any) = match val {
+    case valInt: Int => valInt
+    case _ => throw("fail to cast into Int")
+}
+
+func asAddressString(address: String) = {
+    match addressFromString(address) {
+        case a:Address => a.toString()
+        case _ => throw("fail to cast into Address String")
+    }
+}
+
+# Расчет количества SBT токенов, которые нужно раздать для колличества ревардных токенов
+# Соотношение колл-ва SBT токенов на 1 ревардный токен уменьшается в зависимости от уже отданных SBT
+func calculateCurrentRewardSBTAmount(rewardTokenCount: Int) = {
+  let baseSBTTokenAmountForOneRewardToken = this.getIntegerValue(baseSBTTokenAmountForOneRewardTokenKey)
+  let initialSBTTokensAmount = this.getIntegerValue(initialSBTTokensAmountKey)
+
+  let currentSBTTokensBalance = assetBalance(this, sbtAssetId)
+  if currentSBTTokensBalance == 0 then 0 else
+  
+  let currentSBTTokenAmountForOneRewardToken = fraction(baseSBTTokenAmountForOneRewardToken, currentSBTTokensBalance, initialSBTTokensAmount)
+  let amountSBT = fraction(rewardTokenCount, currentSBTTokenAmountForOneRewardToken, sbtTokenDigits)
+
+  if amountSBT > currentSBTTokensBalance then currentSBTTokensBalance else amountSBT
+}
+
+# Есть ли пул в списке
+func isAuthorizedPool(pool: String) = {
+  let checkedPool = asAddressString(pool)
+  let lpPools = getStringValue(lpPoolsKey)
+
+  contains(lpPools, checkedPool)
+}
+
+# Для получения данных по пулу
+func getPoolData(pool: String) = {
+
+  if !isAuthorizedPool(pool) then throw("Not authorized pool") else
+
+  let poolLpToken = addressFromStringValue(pool).getStringValue("token")
+  let wavesExchangePoolAddress = addressFromStringValue(getStringValue(pool))
+
+  (poolLpToken, wavesExchangePoolAddress)
+}
+
+@Callable(i)
+func constructor(adminAddress: String, sbtStakePool: String, initialSBTTokensAmount: Int, sbtTokensForOneRewardToken: Int) = {
+  if isDefined(getBoolean(isConstructedKey)) then throw("Constructor can be called one time")
+  else
+    let sbWx = Issue("sbWX", "", 0, 8, true, unit, 0)
+    let assetId = sbWx.calculateAssetId()
+
+    let sbtStakePoolChecked = asAddressString(sbtStakePool)
+
+    [
+      sbWx,
+      StringEntry(sbWxAssetIdKey, toBase58String(assetId)),
+      StringEntry(adminAddressKey, asAddressString(adminAddress)),
+      StringEntry(sbtStakePoolKey, sbtStakePoolChecked),
+      IntegerEntry(sbtStakePoolFeeKey, 1400), # 14%
+      IntegerEntry(poolTotalSbtClaimedKey(sbtStakePoolChecked), 0),
+      IntegerEntry(poolTotalWxClaimedKey(sbtStakePoolChecked), 0),
+      StringEntry(lpPoolsKey, ""),
+      StringEntry(additionalRewardPoolKey, ""),
+      IntegerEntry(additionalRewardPoolFeeKey, 600), # 6%
+      BooleanEntry(isConstructedKey, true),
+      IntegerEntry(totalWXLockedKey, 0),
+      IntegerEntry(initialSBTTokensAmountKey, initialSBTTokensAmount),
+      IntegerEntry(baseSBTTokenAmountForOneRewardTokenKey, sbtTokensForOneRewardToken)
+    ]
+}
+# Вызывается пользователем, когда он хочет отдать WX и получить sbWX токены
+# Мы же стейкаем его WX на макс срок на Waves Exchange для получения буста
+@Callable(i)
+func mintSbWx() = {
+  if size(i.payments) != 1 then throw("One Payment expected")
+  else
+    let payment = asPayment(getElement(i.payments, 0))
+    let amount = payment.amount
+    if payment.assetId != wxAssetId || amount <= 0 then throw("Wrong Asset id or amount")
+    else
+      let totalWXLocked = getIntegerValue(totalWXLockedKey)
+      let sbWxAssetId = getStringValue(sbWxAssetIdKey)
+
+      strict wavesExchangeInfo = invoke(Address(wavesExchange), "userMaxDurationREADONLY", [toBase58String(this.bytes)], [])
+      match wavesExchangeInfo {
+        case tuple: (String, Int) => 
+            let functionName = tuple._1
+            let maxLockDuration = tuple._2
+
+            strict result = invoke(Address(wavesExchange), functionName, [maxLockDuration], [payment])
+
+            let sbWx = fromBase58String(sbWxAssetId)
+
+            [
+              Reissue(sbWx, amount, true),
+              ScriptTransfer(Address(i.caller.bytes), amount, sbWx),
+              IntegerEntry(totalWXLockedKey, totalWXLocked + amount)
+            ]
+        case _ => throw("FATAL: Inconsistent data")
+      }
+}
+
+# Для клейма ревардов за стейкинг WX токенов на Waves Exchange
+# Все реварды пересылает на стейкинг контракт sbt токена в наш пул
+# Вызвать может кто угодно
+@Callable(i)
+func claimWxStakingRewards() = {
+  strict currentWxOnContract = assetBalance(this, wxAssetId)
+  strict claimResult = invoke(Address(claimWxRewardContract), "claimReward", [], [])
+  let newWxOnContract = assetBalance(this, wxAssetId)
+  let claimed = newWxOnContract - currentWxOnContract
+  if claimed == 0 then throw("Nothing to claim") else
+
+  let sbtStakePool = getStringValue(sbtStakePoolKey)
+  let sbtStakePoolAddress = addressFromStringValue(sbtStakePool)
+  [
+    IntegerEntry(poolTotalWxClaimedKey(sbtStakePool), getIntegerValue(poolTotalWxClaimedKey(sbtStakePool)) + claimed),
+    ScriptTransfer(sbtStakePoolAddress, claimed, wxAssetId)
+  ]
+}
+
+# Управление нашими пулами:
+
+# Добавление пула
+@Callable(i)
+func addPool(address: String, wavesExchangePoolAddress: String) = {
+  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function")
+  else
+    let lpPools = getStringValue(lpPoolsKey)
+    if isAuthorizedPool(address) then throw("Pool already added")
+    else
+      let newPools = if size(lpPools) == 0 then address else lpPools + SEP + address
+      [
+        StringEntry(lpPoolsKey, newPools), 
+        StringEntry(asAddressString(address), asAddressString(wavesExchangePoolAddress)),
+        IntegerEntry(poolTotalSbtClaimedKey(address), 0),
+        IntegerEntry(poolTotalWxClaimedKey(address), 0)
+      ]
+}
+
+# Удаление пула
+@Callable(i)
+func removePool(address: String) = {
+  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function")
+  else
+    let lpPools = getStringValue(lpPoolsKey)
+    if !isAuthorizedPool(address) then throw("Pool not found")
+    else
+      let poolsArray = split_4C(lpPools, SEP)
+      let poolIndex = asInt(indexOf(poolsArray, address))
+      let newPools = makeString_2C(removeByIndex(poolsArray, poolIndex), SEP)
+      [
+        StringEntry(lpPoolsKey, newPools),
+        DeleteEntry(address)
+      ] ++ if getStringValue(additionalRewardPoolKey) == address then [StringEntry(additionalRewardPoolKey, "")]
+      else []
+}
+
+# Установка пула, как получателя доп наград с наград других пулов
+@Callable(i)
+func setAdditionalRewardsPool(address: String) = {
+  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function")
+  else if !isAuthorizedPool(address) then throw("Only authorized pool can be added as additional reward pool")
+  else [StringEntry(additionalRewardPoolKey, address)]
+}
+
+# Установка нового процента для пула получателя доп наград
+@Callable(i)
+func setAdditionalRewardsPoolFee(fee: Int) = {
+  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function") else
+  if fee > 2000 then throw("Fee can't be bigger than 20%") else
+  if fee < 0 then throw("Fee can't be negative") else
+  [IntegerEntry(additionalRewardPoolFeeKey, fee)]
+}
+
+# Установка нового процента для пула стейкеров SBT
+@Callable(i)
+func setSbtPoolFee(fee: Int) = {
+  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function") else
+  if fee > 2000 then throw("Fee can't be bigger than 20%") else
+  if fee < 0 then throw("Fee can't be negative") else
+  [IntegerEntry(sbtStakePoolFeeKey, fee)]
+}
+
+# Функции для пулов
+
+# Вызывается, когда в какой-то пул стейкают LP токен
+# Пробрасывает стейкинг в Waves Exchange
+@Callable(i)
+func stakePoolLps() = {
+  if size(i.payments) != 1 then throw("One Payment expected") 
+  else
+    let poolData = getPoolData(toBase58String(i.caller.bytes))
+    let poolLpToken = poolData._1
+    let wavesExchangePoolAddress = poolData._2
+
+    let payment = asPayment(getElement(i.payments, 0))
+    if payment.assetId != fromBase58String(poolLpToken) || payment.amount <= 0 then throw("Wrong LP Asset id or amount")
+    else
+      strict result = invoke(wavesExchangePoolAddress, "stake", [], [payment])
+      []
+}
+
+# Вызывается пулом, когда из него хотят забрать LP токены
+# Забирает из Waves Exchange и отсылает пулу
+@Callable(i)
+func withdrawPoolLps(amount: Int) = {
+  let poolData = getPoolData(toBase58String(i.caller.bytes))
+  let poolLpToken = poolData._1
+  let wavesExchangePoolAddress = poolData._2
+
+  strict result = invoke(wavesExchangePoolAddress, "unstake", [poolLpToken, amount], [])
+  [ScriptTransfer(Address(i.caller.bytes), amount, fromBase58String(poolLpToken))]
+}
+
+# Вызывается пулом, когда он хочет склеймить накопившиеся награды
+# Также может вызвать кто угодно, указав адрес пула для клейма
+# Вызывает клейм у Waves Exchange, распределяет награды между пулами
+@Callable(i)
+func claimPoolRewards(pool: String) = {
+  let poolAddress = addressFromStringValue(pool)
+  let poolData = getPoolData(pool)
+  let poolLpToken = poolData._1
+  let wavesExchangePoolAddress = poolData._2
+
+  # Клеймим и расчитываем награды
+  strict currentWXOnContract = assetBalance(this, wxAssetId)
+  strict claimResult = invoke(wavesExchangePoolAddress, "claimWx", [poolLpToken], [])
+  let newWXOnContract = assetBalance(this, wxAssetId)
+  let claimed = newWXOnContract - currentWXOnContract
+
+  if claimed == 0 then throw("Nothing to claim") else
+
+  # Вычисляем доп награды пулу в SBT токенах
+  let sbtRewardAmount = calculateCurrentRewardSBTAmount(claimed)
+  let sbtRewardActions = if sbtRewardAmount == 0 then [] else [
+      ScriptTransfer(poolAddress, sbtRewardAmount + currentWXOnContract, sbtAssetId),
+      IntegerEntry(poolTotalSbtClaimedKey(pool), getIntegerValue(poolTotalSbtClaimedKey(pool)) + sbtRewardAmount)
+    ]
+
+  # Вычисляем доп награды SBT стейкинг пулу и пулу, который выставлен как получатель доп наград
+  let sbtStakePool = getStringValue(sbtStakePoolKey)
+  let sbtStakePoolAddress = addressFromStringValue(sbtStakePool)
+  let sbtStakePoolFee = getIntegerValue(sbtStakePoolFeeKey)
+  let sbtStakePoolAmount = fraction(claimed, sbtStakePoolFee, feeRank, HALFUP)
+  let sbtStakePoolActions = if sbtStakePoolAmount == 0 then [] else [
+      ScriptTransfer(sbtStakePoolAddress, sbtStakePoolAmount, wxAssetId),
+      IntegerEntry(poolTotalWxClaimedKey(sbtStakePool), getIntegerValue(poolTotalWxClaimedKey(sbtStakePool)) + sbtStakePoolAmount)
+    ]
+
+  # Вычисляем колл-во наград для пула, получателя доп наград
+  let additionalRewardPool = getStringValue(additionalRewardPoolKey)
+  let additionalRewardPoolFree = getIntegerValue(additionalRewardPoolFeeKey)
+  let additionalRewardPoolAmount = if size(additionalRewardPool) == 0 then 0
+  else if additionalRewardPool != pool then fraction(claimed, additionalRewardPoolFree, feeRank, HALFUP) else 0
+  let additionalRewardsPoolActions = if additionalRewardPoolAmount == 0 then [] else [
+      ScriptTransfer(addressFromStringValue(additionalRewardPool), additionalRewardPoolAmount, wxAssetId),
+      IntegerEntry(poolTotalWxClaimedKey(additionalRewardPool), getIntegerValue(poolTotalWxClaimedKey(additionalRewardPool)) + additionalRewardPoolAmount)
+    ]
+
+  # Вычисляем оставшиеся награды для вызывающего пула
+  let poolClaimed = claimed - sbtStakePoolAmount - additionalRewardPoolAmount
+
+  # Обновляем данные на контракте, отсылаем реварды вызывающему пулу и всем остальным пулам
+  sbtRewardActions
+  ++
+  sbtStakePoolActions
+  ++
+  additionalRewardsPoolActions
+  ++
+  [
+    ScriptTransfer(poolAddress, poolClaimed, wxAssetId),
+    IntegerEntry(poolTotalWxClaimedKey(pool), getIntegerValue(poolTotalWxClaimedKey(pool)) + poolClaimed)
+  ]
+ }
