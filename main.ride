@@ -271,7 +271,7 @@ func claimPoolRewards(pool: String) = {
 
   # Клеймим и расчитываем награды
   strict currentWXOnContract = assetBalance(this, wxAssetId)
-  strict claimResult = invoke(wavesExchangePoolAddress, "claimWX", [poolLpToken], [])
+  strict claimResult = invoke(wavesExchangePoolAddress, "claimWx", [poolLpToken], [])
   let newWXOnContract = assetBalance(this, wxAssetId)
   let claimed = newWXOnContract - currentWXOnContract
 
@@ -280,7 +280,7 @@ func claimPoolRewards(pool: String) = {
   # Вычисляем доп награды пулу в SBT токенах
   let sbtRewardAmount = calculateCurrentRewardSBTAmount(claimed)
   let sbtRewardActions = if sbtRewardAmount == 0 then [] else [
-      ScriptTransfer(poolAddress, sbtRewardAmount, sbtAssetId),
+      ScriptTransfer(poolAddress, sbtRewardAmount + currentWXOnContract, sbtAssetId),
       IntegerEntry(poolTotalSbtClaimedKey(pool), getIntegerValue(poolTotalSbtClaimedKey(pool)) + sbtRewardAmount)
     ]
 
