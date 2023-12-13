@@ -124,7 +124,7 @@ func asset_balance( a: String ) =
 func account_rewards( asset: String, amount: Int ) =
 {
     if( twap == "" ) then [] else  
-    invoke( getAddressOrAlias( twap ), "push", [ asset, token, amount, token_amount, "0" ], [] )
+    invoke( getAddressOrAlias( twap ), "push", [ asset, token, amount, token_amount, "%" ], [] )
 }
 
 func stop_rewards() =
@@ -320,6 +320,8 @@ func deposit() =
     if( asset_string( payment.assetId ) != token ) then throw( "wrong token: " + asset_string( payment.assetId ) + " != " + token ) else
     if( payment.amount <= 0 ) then throw( "wrong amount, should be positive" ) else
 
+    strict root_contract_claim = if root_contract == "" then [] else
+    invoke(getAddressOrAlias( root_contract ), "claimPoolRewards", [toBase58String(this.bytes)], [])
     strict root_invoke_result = if root_contract == "" then [] else
     invoke(getAddressOrAlias( root_contract ), "stakePoolLps", [], [payment])
 
