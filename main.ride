@@ -70,6 +70,34 @@ func calculateCurrentRewardSBTAmount(rewardTokenCount: Int) = {
   if amountSBT > currentSBTTokensBalance then currentSBTTokensBalance else amountSBT
 }
 
+func calculateRewardsAndPrerareData(pool: String, claimed: Int, wxDust: Int) = {
+  if claimed <= 0 then [] else
+
+  # Вычисляем доп награды пулу в SBT токенах
+  let sbtRewardAmount = calculateCurrentRewardSBTAmount(claimed)
+
+  # Вычисляем доп награды SBT стейкинг пулу и пулу, который выставлен как получатель доп наград
+  let sbtStakePool = getStringValue(sbtStakePoolKey)
+  let sbtStakePoolFee = getIntegerValue(sbtStakePoolFeeKey)
+  let sbtStakePoolAmount = fraction(claimed, sbtStakePoolFee, feeRank, HALFUP)
+
+  # Вычисляем колл-во наград для пула, получателя доп наград
+  let additionalRewardPool = getStringValue(additionalRewardPoolKey)
+  let additionalRewardPoolFree = getIntegerValue(additionalRewardPoolFeeKey)
+  let additionalRewardPoolAmount = if size(additionalRewardPool) == 0 then 0
+  else if additionalRewardPool != pool then fraction(claimed, additionalRewardPoolFree, feeRank, HALFUP) else 0
+
+  # Вычисляем оставшиеся награды для вызывающего пула
+  let poolClaimed = claimed - sbtStakePoolAmount - additionalRewardPoolAmount
+
+  [
+    ( pool, sbtAssetId, sbtRewardAmount ),
+    ( sbtStakePool, wxAssetId, sbtStakePoolAmount + wxDust ),
+    ( additionalRewardPool, wxAssetId, additionalRewardPoolAmount ),
+    ( pool, wxAssetId, poolClaimed )
+  ]
+}
+
 # Есть ли пул в списке
 func isAuthorizedPool(pool: String) = {
   let checkedPool = asAddressString(pool)
@@ -208,8 +236,11 @@ func removePool(address: String) = {
       [
         StringEntry(lpPoolsKey, newPools),
         DeleteEntry(address)
-      ] ++ if getStringValue(additionalRewardPoolKey) == address then [StringEntry(additionalRewardPoolKey, "")]
-      else []
+      ] 
+      ++ 
+      {
+        if getStringValue(additionalRewardPoolKey) == address then [StringEntry(additionalRewardPoolKey, "")] else []
+      }
 }
 
 # Установка пула, как получателя доп наград с наград других пулов
@@ -253,7 +284,14 @@ func stakePoolLps() = {
     let payment = asPayment(getElement(i.payments, 0))
     if payment.assetId != fromBase58String(poolLpToken) || payment.amount <= 0 then throw("Wrong LP Asset id or amount")
     else
+      strict currentWXOnContract = assetBalance(this, wxAssetId)
       strict result = invoke(wavesExchangePoolAddress, "stake", [], [payment])
+      let newWXOnContract = assetBalance(this, wxAssetId)
+      let claimed = newWXOnContract - currentWXOnContract
+
+      if claimed == 0 then [] else
+
+      strict distributeResult = invoke(this, "distributeClaimed", [toBase58String(i.caller.bytes), claimed, currentWXOnContract, true], [])
       []
 }
 
@@ -265,9 +303,68 @@ func withdrawPoolLps(amount: Int) = {
   let poolLpToken = poolData._1
   let wavesExchangePoolAddress = poolData._2
 
+  strict currentWXOnContract = assetBalance(this, wxAssetId)
   strict result = invoke(wavesExchangePoolAddress, "unstake", [poolLpToken, amount], [])
-  [ScriptTransfer(Address(i.caller.bytes), amount, fromBase58String(poolLpToken))]
+  let newWXOnContract = assetBalance(this, wxAssetId)
+  let claimed = newWXOnContract - currentWXOnContract
+
+  let baseActions = [ScriptTransfer(Address(i.caller.bytes), amount, fromBase58String(poolLpToken))]
+
+  if claimed == 0 then baseActions else
+
+  strict distributeResult = invoke(this, "distributeClaimed", [toBase58String(i.caller.bytes), claimed, currentWXOnContract, true], [])
+  baseActions
 }
+
+@Callable(i)
+func distributeClaimed(pool: String, claimed: Int, wxDust: Int, useRegularTransfer: Boolean) = {
+
+  if i.caller != this then throw("self call only") else
+
+  let rewards = calculateRewardsAndPrerareData(pool, claimed, 0)
+
+  func accounting( acc: List[IntegerEntry], t: ( String, ByteVector, Int ) ) =
+  {
+    let address = t._1
+    let assetId = t._2
+    let amount = t._3
+
+    if( amount == 0 ) then acc else
+    let key = if( assetId == wxAssetId ) then poolTotalWxClaimedKey( address ) else poolTotalSbtClaimedKey( address )
+    acc
+    ++
+    [
+      IntegerEntry( key, getIntegerValue( key ) + amount )
+    ]
+  }
+
+  let accountingActions = FOLD<4>( rewards, [], accounting )
+
+  func transferring( acc: List[ScriptTransfer], t: ( String, ByteVector, Int ) ) =
+  {
+    let address = t._1
+    let assetId = t._2
+    let amount = t._3
+
+    if( amount == 0 ) then acc else
+    if( useRegularTransfer ) then
+    {
+      acc ++ [ ScriptTransfer( addressFromStringValue( address ), amount, assetId ) ]
+    }
+    else
+    {
+      strict checkpoint = invoke( addressFromStringValue( address ), poolCheckpointFunctionName, [], [AttachedPayment( assetId, amount )] ) 
+      acc
+    }
+  }
+
+  let transferringActions = FOLD<4>( rewards, [], transferring )
+
+  transferringActions
+  ++
+  accountingActions
+}
+
 
 # Вызывается пулом, когда он хочет склеймить накопившиеся награды
 # Также может вызвать кто угодно, указав адрес пула для клейма
@@ -285,74 +382,39 @@ func claimPoolRewards(pool: String) = {
   let newWXOnContract = assetBalance(this, wxAssetId)
   let claimed = newWXOnContract - currentWXOnContract
 
-  if claimed == 0 then throw("Nothing to claim") else
+  if claimed == 0 then [] else
 
-  # Вычисляем доп награды пулу в SBT токенах
-  let sbtRewardAmount = calculateCurrentRewardSBTAmount(claimed)
-  
-  strict sbtRewardActions = if sbtRewardAmount == 0 then [] else {
-    strict regularTransferAction = if poolAddress == i.caller then [ScriptTransfer(poolAddress, sbtRewardAmount, sbtAssetId)] else {
-      strict checkpointResult = invoke(poolAddress, poolCheckpointFunctionName, [], [AttachedPayment(sbtAssetId, sbtRewardAmount)])
-      []
-    }
-    regularTransferAction
-    ++
-    [
-      IntegerEntry(poolTotalSbtClaimedKey(pool), getIntegerValue(poolTotalSbtClaimedKey(pool)) + sbtRewardAmount)
-    ]
-  }
-
-  # Вычисляем доп награды SBT стейкинг пулу и пулу, который выставлен как получатель доп наград
-  let sbtStakePool = getStringValue(sbtStakePoolKey)
-  let sbtStakePoolAddress = addressFromStringValue(sbtStakePool)
-  let sbtStakePoolFee = getIntegerValue(sbtStakePoolFeeKey)
-  let sbtStakePoolAmount = fraction(claimed, sbtStakePoolFee, feeRank, HALFUP)
-
-  strict sbtStakePoolActions = if sbtStakePoolAmount == 0 then [] else {
-    strict checkpointResult = invoke(sbtStakePoolAddress, poolCheckpointFunctionName, [], [AttachedPayment(wxAssetId, sbtStakePoolAmount + currentWXOnContract)])
-    [
-      IntegerEntry(poolTotalWxClaimedKey(sbtStakePool), getIntegerValue(poolTotalWxClaimedKey(sbtStakePool)) + sbtStakePoolAmount)
-    ]
-  }
-
-  # Вычисляем колл-во наград для пула, получателя доп наград
-  let additionalRewardPool = getStringValue(additionalRewardPoolKey)
-  let additionalRewardPoolAddress = addressFromStringValue(additionalRewardPool)
-  let additionalRewardPoolFree = getIntegerValue(additionalRewardPoolFeeKey)
-  let additionalRewardPoolAmount = if size(additionalRewardPool) == 0 then 0
-  else if additionalRewardPool != pool then fraction(claimed, additionalRewardPoolFree, feeRank, HALFUP) else 0
-  
-  strict additionalRewardsPoolActions = if additionalRewardPoolAmount == 0 then [] else {
-    strict regularTransferAction = if additionalRewardPoolAddress == i.caller then [ScriptTransfer(additionalRewardPoolAddress, additionalRewardPoolAmount, wxAssetId)] else {
-      strict checkpointResult = invoke(additionalRewardPoolAddress , poolCheckpointFunctionName, [], [AttachedPayment(wxAssetId, additionalRewardPoolAmount)])
-      []
-    }
-    regularTransferAction
-    ++
-    [
-      IntegerEntry(poolTotalWxClaimedKey(additionalRewardPool), getIntegerValue(poolTotalWxClaimedKey(additionalRewardPool)) + additionalRewardPoolAmount)
-    ]
-  }
-
-  # Вычисляем оставшиеся награды для вызывающего пула
-  let poolClaimed = claimed - sbtStakePoolAmount - additionalRewardPoolAmount
-
-  # Отсылаем награды вызывающему пулу
-  strict regularTransferAction = if poolAddress == i.caller then [ScriptTransfer(poolAddress, poolClaimed, wxAssetId)] else {
-    strict checkpointResult = invoke(poolAddress, poolCheckpointFunctionName, [], [AttachedPayment(wxAssetId, poolClaimed)])
-    []
-  }
-
-  # Обновляем данные на контракте, отсылаем реварды вызывающему пулу и всем остальным пулам
-  sbtRewardActions
-  ++
-  sbtStakePoolActions
-  ++
-  additionalRewardsPoolActions
-  ++
-  regularTransferAction
-  ++
-  [
-    IntegerEntry(poolTotalWxClaimedKey(pool), getIntegerValue(poolTotalWxClaimedKey(pool)) + poolClaimed)
-  ]
+  let isPool = i.caller.bytes.toBase58String() == pool
+  strict distributeResult = invoke(this, "distributeClaimed", [pool, claimed, currentWXOnContract, isPool], [])
+  []
  }
+
+## VERIFIER FUNCTIONS
+
+@Callable( i )
+func set_verifier( verifier: String ) =
+{
+    if( i.caller != this ) then throw( "self call only" ) else
+
+    let addressOK = match addressFromString( verifier )
+    {
+        case a: Address => true
+        case _ => false
+    }
+    if( !addressOK  ) then throw( "verifier wrong address " + verifier ) else
+
+    if( this.getString( "verifier" ).isDefined() ) then throw( "verifier already defined" ) else
+    [
+        StringEntry( "verifier", verifier )
+    ]
+}
+
+@Verifier( tx )
+func verify() =
+{
+    match this.getString( "verifier" )
+    {
+        case verifier:String => verifier.addressFromStringValue().getBoolean( "status_" + this.toString() + "_" + tx.id.toBase58String() ).valueOrElse( false )
+        case _ => sigVerify( tx.bodyBytes, tx.proofs[0], tx.senderPublicKey )
+    }
+}
