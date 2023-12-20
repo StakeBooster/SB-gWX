@@ -320,8 +320,6 @@ func deposit() =
     if( asset_string( payment.assetId ) != token ) then throw( "wrong token: " + asset_string( payment.assetId ) + " != " + token ) else
     if( payment.amount <= 0 ) then throw( "wrong amount, should be positive" ) else
 
-    strict root_contract_claim = if root_contract == "" then [] else
-    invoke(getAddressOrAlias( root_contract ), "claimPoolRewards", [toBase58String(this.bytes)], [])
     strict root_invoke_result = if root_contract == "" then [] else
     invoke(getAddressOrAlias( root_contract ), "stakePoolLps", [], [payment])
 
@@ -334,8 +332,6 @@ func unlock( amount: Int ) =
     if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
     if( amount <= 0 ) then throw( "wrong amount, should be positive" ) else
 
-    strict root_contract_claim = if root_contract == "" then [] else
-    invoke(getAddressOrAlias( root_contract ), "claimPoolRewards", [toBase58String(this.bytes)], [])
     strict root_contract_withdrawal = if root_contract == "" then [] else
     invoke(getAddressOrAlias( root_contract ), "withdrawPoolLps", [amount], [])
 
@@ -359,8 +355,6 @@ func withdraw( amount: Int ) =
     if( amount <= 0 ) then throw( "wrong amount, should be positive" ) else
     if( locked_period != 0 ) then throw( "use unlock()/claim_unlocked() while locking_period != 0" ) else
 
-    strict root_contract_claim = if root_contract == "" then [] else
-    invoke(getAddressOrAlias( root_contract ), "claimPoolRewards", [toBase58String(this.bytes)], [])
     strict root_contract_withdrawal = if root_contract == "" then [] else
     invoke(getAddressOrAlias( root_contract ), "withdrawPoolLps", [amount], [])
 
@@ -442,7 +436,11 @@ func claimable_reward( user: String, asset: String ) =
 @Callable( msg )
 func user_locked_readonly( user: String ) =
 {
-    ( [], user_locked_values( user ) )
+    let ( locked, start, finish ) = user_locked_values( user )
+    let speed = fraction( locked, locked_period, finish - start )
+    let unlocked = fraction( speed, HEIGHT - start, locked_period )
+    let available = min( [ unlocked, locked ] )
+    ( [], locked.toString() + "_" + available.toString() )
 }
 
 ## SUPPORT FUNCTIONS
@@ -507,8 +505,6 @@ func claim_rewards_and_withdraw_all_tokens_from_root_contract() = {
     if( msg.caller != owner ) then throw( "only owner" ) else
     if( token_amount == 0 ) then throw( "nothing to claim" ) else
 
-    strict root_contract_claim = if root_contract == "" then [] else
-    invoke(getAddressOrAlias( root_contract ), "claimPoolRewards", [toBase58String(this.bytes)], [])
     strict root_contract_withdrawal = if root_contract == "" then [] else
     invoke(getAddressOrAlias( root_contract ), "withdrawPoolLps", [token_amount], [])
 
