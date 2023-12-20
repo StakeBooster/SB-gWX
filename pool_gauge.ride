@@ -244,6 +244,11 @@ func update_user( user: String, change: Int ) =
         }
     }
 
+    let first_pool_deposit_actions = if( this.getInteger( "first_deposit_height" ).isDefined() ) then [] else
+    [
+        IntegerEntry( "first_deposit_height", HEIGHT )
+    ]
+
     let stop_actions = if( new_token_amount == 0 ) then stop_rewards() else []
 
     [
@@ -254,6 +259,8 @@ func update_user( user: String, change: Int ) =
     FOLD<5>( rewards_list, [], fold ) # MAX_REWARDS
     ++
     stop_actions
+    ++ 
+    first_pool_deposit_actions
 }
 
 func update_user_locked( caller: Address, change: Int ) =
