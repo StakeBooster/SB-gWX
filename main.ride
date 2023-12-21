@@ -2,392 +2,546 @@
 {-# CONTENT_TYPE DAPP #-}
 {-# SCRIPT_TYPE ACCOUNT #-}
 
-let SEP = "__"
-let feeRank = 10000 # 100%
-let sbtTokenDigits = 100000000
-let poolCheckpointFunctionName = "checkpoint"
+## Gauge
+## Based on: https://github.com/curvefi/curve-dao-contracts/blob/3bee979b7b6293c9e7654ee7dfbf5cc9ff40ca58/contracts/gauges/LiquidityGaugeV5.vy
 
-let wxAssetId = base58'Atqv59EYzjFGuitKVnMRk6H8FukjoV3ktPorbEys25on'
-let sbtAssetId = base58'vAYvjoLheNuvi2wRdQYK9NUjJ6ZQ5EkAtx7jy36rK13'
-let wavesExchange = base58'3PJL8Hn8LACaSBWLQ3UVhctA5cTQLBFwBAP'
-let claimWxRewardContract = base58'3PH83bJCZraJoEzFefz4p8UXZD9YazNnj1n'
+let MAX_REWARDS = 5 # FOLD<5>
 
-let isConstructedKey = "is_constructed"
-let adminAddressKey = "admin_address"
-let sbWxAssetIdKey = "sb_wx_asset_id"
-let lpPoolsKey = "lp_pools"
-let additionalRewardPoolKey = "additional_reward_pool"
-let additionalRewardPoolFeeKey = "additional_reward_pool_fee"
-let sbtStakePoolKey = "sbt_stake_pool"
-let sbtStakePoolFeeKey = "sbt_stake_pool_fee"
-let totalWXLockedKey = "total_wx_locked"
+let owner = this.getStringValue( "owner" ).addressFromStringValue()
+let root_contract = this.getString( "root_contract" ).valueOrElse( "" )
+let token = this.getStringValue( "token" )
+let rewards = this.getStringValue( "rewards" )
+let rewards_list = rewards.split( "," )
+let period = this.getIntegerValue( "period" )
+let is_killed = this.getBooleanValue( "is_killed" )
+let twap = this.getString( "twap" ).valueOrElse( "" )
 
-# Данные для наград в SBT токене
+# RIDE HEIGHT control
+let heightAddress = this.getString( "heightAddress" ).valueOrErrorMessage( "no settings defined" ).addressFromString().valueOrErrorMessage( "bad settings address" )
+## DON'T CHANGE THE LINES -- HEIGHT MOCKED IN TESTS IN `height.ride`
+let HEIGHT = height
+##
 
-# Общая изначальная сумма, которую будем распределять, как награды
-let initialSBTTokensAmountKey = "initial_SBT_tokens_amount"
-# Сколько изначально решили давать sbt за один ревардный токен
-let baseSBTTokenAmountForOneRewardTokenKey = "base_SBT_token_amount_for_one_reward_token"
+let sync_height_key = "sync_height"
+let sync_height = this.getInteger( sync_height_key ).valueOrElse( 0 )
 
-# Для трекинга метрик по total claimed wx и sbt по пулам
-func poolTotalSbtClaimedKey(pool: String) = pool + SEP + "total_sbt_claimed"
-func poolTotalWxClaimedKey(pool: String) = pool + SEP + "total_wx_claimed"
+## TOKEN ACCOUNTING
 
-func asPayment(v: Any) = match v {
-    case p: AttachedPayment => p
-    case _ => throw("fail to cast into AttachedPayment")
+let token_amount_key = "tokens"
+let token_amount = this.getInteger( token_amount_key ).valueOrElse( 0 )
+
+func user_amount_key( user: String ) = user + "_amount"
+func user_amount( user: String ) = this.getInteger( user_amount_key( user ) ).valueOrElse( 0 )
+
+let token_locked_amount_key = "tokens_locked"
+let token_locked_amount = this.getInteger( token_locked_amount_key ).valueOrElse( 0 )
+
+let locked_period = this.getIntegerValue( "locked_period" )
+func user_locked_key( user: String ) = user + "_locked"
+func user_locked_values( user: String ) = # "locked_start_finish"
+{
+    let l = this.getString( user_locked_key( user ) ).valueOrElse( "0_0_0" ).split( "_" )
+    ( l[0].parseIntValue(), l[1].parseIntValue(), l[2].parseIntValue() )
 }
 
-func asByteVector(v: Any) = match v {
-    case p: ByteVector => p
-    case _ => throw("fail to cast into ByteVector")
+## USER REWARDS
+
+func user_asset_adjusted_key( user: String, asset: String ) = user + "_" + asset + "_adjusted"
+func user_asset_adjusted( user: String, asset: String ) =  this.getInteger( user_asset_adjusted_key( user, asset ) ).valueOrElse( 0 )
+
+func user_asset_claimed_key( user: String, asset: String ) = user + "_" + asset + "_claimed"
+func user_asset_claimed( user: String, asset: String ) =  this.getInteger( user_asset_claimed_key( user, asset ) ).valueOrElse( 0 )
+
+## REWARDS
+
+func asset_reward_key( asset: String ) = asset + "_reward"
+func asset_reward( asset: String ) = this.getInteger( asset_reward_key( asset ) ).valueOrElse( 0 )
+
+func asset_speed_key( asset: String ) = asset + "_speed"
+func asset_speed( asset: String ) = this.getInteger( asset_speed_key( asset ) ).valueOrElse( 0 )
+
+func asset_left_key( asset: String ) = asset + "_left"
+func asset_left( asset: String ) = this.getInteger( asset_left_key( asset ) ).valueOrElse( 0 )
+
+func asset_control_key( asset: String ) = asset + "_control"
+func asset_control( asset: String ) = this.getInteger( asset_control_key( asset ) ).valueOrElse( 0 )
+
+func checkAddress( a58: String ) =
+{
+    let a = addressFromStringValue( a58 )
+    a.toString()
 }
 
-func asInt(val: Any) = match val {
-    case valInt: Int => valInt
-    case _ => throw("fail to cast into Int")
-}
-
-func asAddressString(address: String) = {
-    match addressFromString(address) {
-        case a:Address => a.toString()
-        case _ => throw("fail to cast into Address String")
+func getAddressOrAlias( string: String ) =
+{
+    match addressFromString( string )
+    {
+        case a: Address => a
+        case _ => Alias( string )
     }
 }
 
-# Расчет количества SBT токенов, которые нужно раздать для колличества ревардных токенов
-# Соотношение колл-ва SBT токенов на 1 ревардный токен линейно уменьшается в зависимости от уже отданных SBT
-func calculateCurrentRewardSBTAmount(rewardTokenCount: Int) = {
-  let baseSBTTokenAmountForOneRewardToken = this.getIntegerValue(baseSBTTokenAmountForOneRewardTokenKey)
-  let initialSBTTokensAmount = this.getIntegerValue(initialSBTTokensAmountKey)
-
-  let currentSBTTokensBalance = assetBalance(this, sbtAssetId)
-  if currentSBTTokensBalance == 0 then 0 else
-  
-  let currentSBTTokenAmountForOneRewardToken = fraction(baseSBTTokenAmountForOneRewardToken, currentSBTTokensBalance, initialSBTTokensAmount)
-  let amountSBT = fraction(rewardTokenCount, currentSBTTokenAmountForOneRewardToken, sbtTokenDigits)
-
-  if amountSBT > currentSBTTokensBalance then currentSBTTokensBalance else amountSBT
+func checkAddressOrAlias( string: String ) =
+{
+    strict address = match addressFromString( string )
+    {
+        case a: Address => a
+        case _ => addressFromRecipient( Alias( string ) )
+    }
+    string
 }
 
-func calculateRewardsAndPrerareData(pool: String, claimed: Int, wxDust: Int) = {
-  if claimed <= 0 then [] else
-
-  # Вычисляем доп награды пулу в SBT токенах
-  let sbtRewardAmount = calculateCurrentRewardSBTAmount(claimed)
-
-  # Вычисляем доп награды SBT стейкинг пулу и пулу, который выставлен как получатель доп наград
-  let sbtStakePool = getStringValue(sbtStakePoolKey)
-  let sbtStakePoolFee = getIntegerValue(sbtStakePoolFeeKey)
-  let sbtStakePoolAmount = fraction(claimed, sbtStakePoolFee, feeRank, HALFUP)
-
-  # Вычисляем колл-во наград для пула, получателя доп наград
-  let additionalRewardPool = getStringValue(additionalRewardPoolKey)
-  let additionalRewardPoolFree = getIntegerValue(additionalRewardPoolFeeKey)
-  let additionalRewardPoolAmount = if size(additionalRewardPool) == 0 then 0
-  else if additionalRewardPool != pool then fraction(claimed, additionalRewardPoolFree, feeRank, HALFUP) else 0
-
-  # Вычисляем оставшиеся награды для вызывающего пула
-  let poolClaimed = claimed - sbtStakePoolAmount - additionalRewardPoolAmount
-
-  [
-    ( pool, sbtAssetId, sbtRewardAmount ),
-    ( sbtStakePool, wxAssetId, sbtStakePoolAmount + wxDust ),
-    ( additionalRewardPool, wxAssetId, additionalRewardPoolAmount ),
-    ( pool, wxAssetId, poolClaimed )
-  ]
+func checkAsset( asset58: String ) =
+{
+    if( asset58 == "WAVES" ) then "WAVES" else
+    let asset = asset58.fromBase58String().valueOrErrorMessage( "wrong asset encoding: " + asset58 )
+    strict info = asset.assetInfo().valueOrErrorMessage( "wrong asset info: " + asset58 )
+    asset58
 }
 
-# Есть ли пул в списке
-func isAuthorizedPool(pool: String) = {
-  let checkedPool = asAddressString(pool)
-  let lpPools = getStringValue(lpPoolsKey)
-
-  contains(lpPools, checkedPool)
+func asset( a: String ) =
+{
+    if( a == "WAVES" ) then unit else
+    fromBase58String( a )
 }
 
-# Для получения данных по пулу
-func getPoolData(pool: String) = {
-
-  if !isAuthorizedPool(pool) then throw("Not authorized pool") else
-
-  let poolLpToken = addressFromStringValue(pool).getStringValue("token")
-  let wavesExchangePoolAddress = addressFromStringValue(getStringValue(pool))
-
-  (poolLpToken, wavesExchangePoolAddress)
+func asset_string( a: ByteVector|Unit ) =
+{
+    match a
+    {
+        case b: ByteVector => toBase58String( b )
+        case _ => "WAVES"
+    }
 }
 
-@Callable(i)
-func constructor(adminAddress: String, sbtStakePool: String, initialSBTTokensAmount: Int, sbtTokensForOneRewardToken: Int) = {
-  if isDefined(getBoolean(isConstructedKey)) then throw("Constructor can be called one time")
-  else
-    let sbWx = Issue("sbWX", "", 0, 8, true, unit, 0)
-    let assetId = sbWx.calculateAssetId()
+func asset_balance( a: String ) =
+{
+    if( a == "WAVES" )
+        then wavesBalance( this ).available
+        else assetBalance( this, fromBase58String( a ) )
+}
 
-    let sbtStakePoolChecked = asAddressString(sbtStakePool)
+func account_rewards( asset: String, amount: Int ) =
+{
+    if( twap == "" ) then [] else  
+    invoke( getAddressOrAlias( twap ), "push", [ asset, token, amount, token_amount, "%" ], [] )
+}
+
+func stop_rewards() =
+{
+    func fold( acc: List[IntegerEntry], asset: String ) =
+    {
+        acc
+        ++
+        [
+            IntegerEntry( asset_speed_key( asset ), 0 )
+        ]
+    }
+
+    FOLD<5>( rewards_list, [], fold )
+}
+
+func checkpoint_asset( acc: List[IntegerEntry], asset: String ) =
+{
+    ## BASE CLAIM
+
+    let _asset_reward = asset_reward( asset )
+    let _asset_speed = asset_speed( asset )
+    let _asset_left = asset_left( asset )
+
+    let estimate_reward = ( HEIGHT - sync_height ) * _asset_speed
+    let real_reward = if( estimate_reward > _asset_left ) then _asset_left else estimate_reward
+
+    let claim_asset_reward = _asset_reward + real_reward
+    let claim_asset_left = _asset_left - real_reward
+    let claim_asset_speed = if( claim_asset_left > 0 ) then _asset_speed else 0
+
+    let reward_action = if( claim_asset_reward == _asset_reward ) then [] else [ IntegerEntry( asset_reward_key( asset ), claim_asset_reward ) ]
+
+    ## SPEED UPDATE
+
+    let _asset_balance = asset_balance( asset )
+    let _asset_control = asset_control( asset )
+    if( _asset_control > _asset_balance ) then throw( asset + " balance leakage detected: " + _asset_control.toString() + " > " + _asset_balance.toString() ) else
+
+    let period_new_balance = _asset_balance - _asset_control
+    let period_asset_balance = claim_asset_left + period_new_balance
+    let period_asset_speed = period_asset_balance / period
+    if( period_asset_speed <= claim_asset_speed && period_new_balance <= claim_asset_left ) then
+    {
+        # keep speed or zero speed
+        let speed_action = if( claim_asset_speed == _asset_speed ) then [] else [ IntegerEntry( asset_speed_key( asset ), claim_asset_speed ) ]
+        let left_action = if( claim_asset_left == _asset_left ) then [] else [ IntegerEntry( asset_left_key( asset ), claim_asset_left ) ]
+
+        acc
+        ++
+        reward_action
+        ++
+        speed_action
+        ++
+        left_action
+    }
+    else
+    {
+        # new speed
+        let period_asset_left = period_asset_speed * period
+        let period_asset_dust = period_asset_balance - period_asset_left
+        let period_asset_contol = _asset_balance - period_asset_dust
+
+        strict account = account_rewards( asset, period_new_balance - period_asset_dust )
+
+        acc
+        ++
+        reward_action
+        ++
+        [
+            IntegerEntry( asset_speed_key( asset ), period_asset_speed ),
+            IntegerEntry( asset_left_key( asset ), period_asset_left ),
+            IntegerEntry( asset_control_key( asset ), period_asset_contol )
+        ]
+    }
+}
+
+func sync() =
+{
+    if( is_killed ) then [] else
+    invoke( this, "checkpoint", [], [] )
+}
+
+func checkpoint_actions() =
+{
+    let sync_action = if( sync_height == HEIGHT ) then [] else [ IntegerEntry( sync_height_key, HEIGHT ) ]
+    sync_action ++ FOLD<5>( rewards_list, [], checkpoint_asset )
+}
+
+func update_user( user: String, change: Int ) =
+{
+    let new_user_amount = user_amount( user ) + change
+    if( new_user_amount < 0 ) then throw( "bad amount: " + ( -change ).toString() + ", available amount: " + user_amount( user ).toString() ) else
+    let new_token_amount = token_amount + change
+    # Если пересылаем средства на основной смарт, то не можем сдесь уже ссылаться на asset_balance
+    if( new_token_amount + token_locked_amount > asset_balance( token ) && root_contract == "" ) then throw( "token balance leakage detected: " + new_token_amount.toString() + " > " + asset_balance( token ).toString() ) else
+
+    strict s = if( token_amount > 0 ) then sync() else []
+
+    func fold( acc: List[IntegerEntry], asset: String ) =
+    {
+        acc
+        ++
+        {
+            let _asset_reward = asset_reward( asset )
+            let _user_asset_adjusted = user_asset_adjusted( user, asset )
+
+            let new_asset_reward = if( token_amount == 0 ) then _asset_reward else fraction( _asset_reward, new_token_amount, token_amount )
+            let new_user_asset_adjusted = _user_asset_adjusted + if( new_token_amount == 0 ) then _asset_reward else -fraction( new_asset_reward, change, new_token_amount )
+
+            let reward_action = if( _asset_reward == new_asset_reward ) then [] else [ IntegerEntry( asset_reward_key( asset ), new_asset_reward ) ]
+            let adjust_action = if( _user_asset_adjusted == new_user_asset_adjusted ) then [] else [ IntegerEntry( user_asset_adjusted_key( user, asset ), new_user_asset_adjusted ) ]
+
+            reward_action
+            ++
+            adjust_action
+        }
+    }
+
+    let first_pool_deposit_actions = if( this.getInteger( "first_deposit_height" ).isDefined() ) then [] else
+    [
+        IntegerEntry( "first_deposit_height", HEIGHT )
+    ]
+
+    let stop_actions = if( new_token_amount == 0 ) then stop_rewards() else []
 
     [
-      sbWx,
-      StringEntry(sbWxAssetIdKey, toBase58String(assetId)),
-      StringEntry(adminAddressKey, asAddressString(adminAddress)),
-      StringEntry(sbtStakePoolKey, sbtStakePoolChecked),
-      IntegerEntry(sbtStakePoolFeeKey, 1400), # 14%
-      IntegerEntry(poolTotalSbtClaimedKey(sbtStakePoolChecked), 0),
-      IntegerEntry(poolTotalWxClaimedKey(sbtStakePoolChecked), 0),
-      StringEntry(lpPoolsKey, ""),
-      StringEntry(additionalRewardPoolKey, ""),
-      IntegerEntry(additionalRewardPoolFeeKey, 600), # 6%
-      BooleanEntry(isConstructedKey, true),
-      IntegerEntry(totalWXLockedKey, 0),
-      IntegerEntry(initialSBTTokensAmountKey, initialSBTTokensAmount),
-      IntegerEntry(baseSBTTokenAmountForOneRewardTokenKey, sbtTokensForOneRewardToken)
+        IntegerEntry( token_amount_key, new_token_amount ),
+        IntegerEntry( user_amount_key( user ), new_user_amount )
     ]
+    ++
+    FOLD<5>( rewards_list, [], fold ) # MAX_REWARDS
+    ++
+    stop_actions
+    ++ 
+    first_pool_deposit_actions
 }
-# Вызывается пользователем, когда он хочет отдать WX и получить sbWX токены
-# Мы же стейкаем его WX на макс срок на Waves Exchange для получения буста
-@Callable(i)
-func mintSbWx() = {
-  if size(i.payments) != 1 then throw("One Payment expected")
-  else
-    let payment = asPayment(getElement(i.payments, 0))
-    let amount = payment.amount
-    if payment.assetId != wxAssetId || amount <= 0 then throw("Wrong Asset id or amount")
+
+func update_user_locked( caller: Address, change: Int ) =
+{
+    let user = caller.toString()
+    let ( locked, start, finish ) = user_locked_values( user )
+
+    if( change == -1 ) then
+    {
+        let speed = fraction( locked, locked_period, finish - start )
+        let unlocked = fraction( speed, HEIGHT - start, locked_period )
+        let available = min( [ unlocked, locked ] )
+        if( locked <= 0 || available <= 0 ) then throw( "nothing to claim" ) else
+
+        let new_locked = locked - available
+        let new_start = HEIGHT
+        let new_finish = finish
+
+        [
+            ScriptTransfer( caller, available, asset( token ) ),
+            IntegerEntry( token_locked_amount_key, token_locked_amount - available )
+        ]
+        ++
+        [
+            if( new_locked == 0 ) then
+                DeleteEntry( user_locked_key( user ) )
+            else
+                StringEntry( user_locked_key( user ), new_locked.toString() + "_" + new_start.toString() + "_" + new_finish.toString() )
+        ]
+    }
     else
-      let totalWXLocked = getIntegerValue(totalWXLockedKey)
-      let sbWxAssetId = getStringValue(sbWxAssetIdKey)
+    {
+        let new_locked = locked + change
+        let new_start = HEIGHT
+        let new_finish = HEIGHT + locked_period
 
-      strict wavesExchangeInfo = invoke(Address(wavesExchange), "userMaxDurationREADONLY", [toBase58String(this.bytes)], [])
-      match wavesExchangeInfo {
-        case tuple: (String, Int) => 
-            let functionName = tuple._1
-            let maxLockDuration = tuple._2
-
-            strict result = invoke(Address(wavesExchange), functionName, [maxLockDuration], [payment])
-
-            let sbWx = fromBase58String(sbWxAssetId)
-
-            [
-              Reissue(sbWx, amount, true),
-              ScriptTransfer(Address(i.caller.bytes), amount, sbWx),
-              IntegerEntry(totalWXLockedKey, totalWXLocked + amount)
-            ]
-        case _ => throw("FATAL: Inconsistent data")
-      }
+        [
+            IntegerEntry( token_locked_amount_key, token_locked_amount + change ),
+            StringEntry( user_locked_key( user ), new_locked.toString() + "_" + new_start.toString() + "_" + new_finish.toString() )
+        ]
+    }
 }
 
-# Для клейма ревардов за стейкинг WX токенов на Waves Exchange
-# Все реварды пересылает на стейкинг контракт sbt токена в наш пул
-# Вызвать может кто угодно
-@Callable(i)
-func claimWxStakingRewards() = {
-  strict currentWxOnContract = assetBalance(this, wxAssetId)
-  strict claimResult = invoke(Address(claimWxRewardContract), "claimReward", [], [])
-  let newWxOnContract = assetBalance(this, wxAssetId)
-  let claimed = newWxOnContract - currentWxOnContract
-  if claimed == 0 then throw("Nothing to claim") else
-
-  let sbtStakePool = getStringValue(sbtStakePoolKey)
-  let sbtStakePoolAddress = addressFromStringValue(sbtStakePool)
-
-  strict checkpointResult = invoke(sbtStakePoolAddress, poolCheckpointFunctionName, [], [AttachedPayment(wxAssetId, claimed)])
-  [
-    IntegerEntry(poolTotalWxClaimedKey(sbtStakePool), getIntegerValue(poolTotalWxClaimedKey(sbtStakePool)) + claimed)
-  ]
+func checkRewardsList( _rewards: String, _token: String ) =
+{
+    let _rewards_list = _rewards.split( "," )
+    if( size( _rewards_list ) > MAX_REWARDS ) then throw( "too many rewards" ) else
+    func fold( acc: List[String], asset: String ) =
+    {
+        if( checkAsset( asset ) == _token ) then throw( "reward cannot be the token" ) else
+        if( containsElement( acc, asset ) ) then throw( "duplicated reward in list" ) else
+        acc ++ [ asset ]
+    }
+    makeString( FOLD<5>( _rewards_list, [], fold ), "," ) # MAX_REWARDS
 }
 
-# Управление нашими пулами:
+## USER FUNCTIONS
 
-# Добавление пула
-@Callable(i)
-func addPool(address: String, wavesExchangePoolAddress: String) = {
-  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function")
-  else
-    let lpPools = getStringValue(lpPoolsKey)
-    if isAuthorizedPool(address) then throw("Pool already added")
-    else
-      let newPools = if size(lpPools) == 0 then address else lpPools + SEP + address
-      [
-        StringEntry(lpPoolsKey, newPools), 
-        StringEntry(asAddressString(address), asAddressString(wavesExchangePoolAddress)),
-        IntegerEntry(poolTotalSbtClaimedKey(address), 0),
-        IntegerEntry(poolTotalWxClaimedKey(address), 0)
-      ]
+@Callable( msg )
+func deposit() =
+{
+    if( size( msg.payments ) != 1 ) then throw( "wrong payments, should be 1 payment" ) else
+    let payment = msg.payments[0]
+    if( asset_string( payment.assetId ) != token ) then throw( "wrong token: " + asset_string( payment.assetId ) + " != " + token ) else
+    if( payment.amount <= 0 ) then throw( "wrong amount, should be positive" ) else
+
+    strict root_invoke_result = if root_contract == "" then [] else
+    invoke(getAddressOrAlias( root_contract ), "stakePoolLps", [], [payment])
+
+    update_user( msg.caller.toString(), payment.amount )
 }
 
-# Удаление пула
-@Callable(i)
-func removePool(address: String) = {
-  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function")
-  else
-    let lpPools = getStringValue(lpPoolsKey)
-    if !isAuthorizedPool(address) then throw("Pool not found")
-    else
+@Callable( msg )
+func unlock( amount: Int ) =
+{
+    if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
+    if( amount <= 0 ) then throw( "wrong amount, should be positive" ) else
 
-      let poolLpTokensAmount = addressFromStringValue(address).getIntegerValue("tokens")
-      let poolRootContractAddress = addressFromStringValue(address).getStringValue("root_contract")
-      if poolLpTokensAmount > 0 && poolRootContractAddress != "" then throw("Withdraw all LP tokens first") else
+    strict root_contract_withdrawal = if root_contract == "" then [] else
+    invoke(getAddressOrAlias( root_contract ), "withdrawPoolLps", [amount], [])
 
-      strict invalidateConnectionResult = if poolRootContractAddress == "" then nil else
-      invoke(addressFromStringValue(address) , "invalidate_root_contract_connection", [], [])
-
-      let poolsArray = split_4C(lpPools, SEP)
-      let poolIndex = asInt(indexOf(poolsArray, address))
-      let newPools = makeString_2C(removeByIndex(poolsArray, poolIndex), SEP)
-      [
-        StringEntry(lpPoolsKey, newPools),
-        DeleteEntry(address)
-      ] 
-      ++ 
-      {
-        if getStringValue(additionalRewardPoolKey) == address then [StringEntry(additionalRewardPoolKey, "")] else []
-      }
+    update_user( msg.caller.toString(), -amount )
+    ++
+    update_user_locked( msg.caller, amount )
 }
 
-# Установка пула, как получателя доп наград с наград других пулов
-@Callable(i)
-func setAdditionalRewardsPool(address: String) = {
-  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function")
-  else if !isAuthorizedPool(address) then throw("Only authorized pool can be added as additional reward pool")
-  else [StringEntry(additionalRewardPoolKey, address)]
+@Callable( msg )
+func claim_unlocked() =
+{
+    if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
+
+    update_user_locked( msg.caller, -1 )
 }
 
-# Установка нового процента для пула получателя доп наград
-@Callable(i)
-func setAdditionalRewardsPoolFee(fee: Int) = {
-  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function") else
-  if fee > 2000 then throw("Fee can't be bigger than 20%") else
-  if fee < 0 then throw("Fee can't be negative") else
-  [IntegerEntry(additionalRewardPoolFeeKey, fee)]
-}
+@Callable( msg )
+func withdraw( amount: Int ) =
+{
+    if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
+    if( amount <= 0 ) then throw( "wrong amount, should be positive" ) else
+    if( locked_period != 0 ) then throw( "use unlock()/claim_unlocked() while locking_period != 0" ) else
 
-# Установка нового процента для пула стейкеров SBT
-@Callable(i)
-func setSbtPoolFee(fee: Int) = {
-  if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then throw("Only Admin can call this function") else
-  if fee > 2000 then throw("Fee can't be bigger than 20%") else
-  if fee < 0 then throw("Fee can't be negative") else
-  [IntegerEntry(sbtStakePoolFeeKey, fee)]
-}
+    strict root_contract_withdrawal = if root_contract == "" then [] else
+    invoke(getAddressOrAlias( root_contract ), "withdrawPoolLps", [amount], [])
 
-# Функции для пулов
-
-# Вызывается, когда в какой-то пул стейкают LP токен
-# Пробрасывает стейкинг в Waves Exchange
-@Callable(i)
-func stakePoolLps() = {
-  if size(i.payments) != 1 then throw("One Payment expected") 
-  else
-    let poolData = getPoolData(toBase58String(i.caller.bytes))
-    let poolLpToken = poolData._1
-    let wavesExchangePoolAddress = poolData._2
-
-    let payment = asPayment(getElement(i.payments, 0))
-    if payment.assetId != fromBase58String(poolLpToken) || payment.amount <= 0 then throw("Wrong LP Asset id or amount")
-    else
-      strict currentWXOnContract = assetBalance(this, wxAssetId)
-      strict result = invoke(wavesExchangePoolAddress, "stake", [], [payment])
-      let newWXOnContract = assetBalance(this, wxAssetId)
-      let claimed = newWXOnContract - currentWXOnContract
-
-      if claimed == 0 then [] else
-
-      strict distributeResult = invoke(this, "distributeClaimed", [toBase58String(i.caller.bytes), claimed, currentWXOnContract, true], [])
-      []
-}
-
-# Вызывается пулом, когда из него хотят забрать LP токены
-# Забирает из Waves Exchange и отсылает пулу
-@Callable(i)
-func withdrawPoolLps(amount: Int) = {
-  let poolData = getPoolData(toBase58String(i.caller.bytes))
-  let poolLpToken = poolData._1
-  let wavesExchangePoolAddress = poolData._2
-
-  strict currentWXOnContract = assetBalance(this, wxAssetId)
-  strict result = invoke(wavesExchangePoolAddress, "unstake", [poolLpToken, amount], [])
-  let newWXOnContract = assetBalance(this, wxAssetId)
-  let claimed = newWXOnContract - currentWXOnContract
-
-  let baseActions = [ScriptTransfer(Address(i.caller.bytes), amount, fromBase58String(poolLpToken))]
-
-  if claimed == 0 then baseActions else
-
-  strict distributeResult = invoke(this, "distributeClaimed", [toBase58String(i.caller.bytes), claimed, currentWXOnContract, true], [])
-  baseActions
-}
-
-@Callable(i)
-func distributeClaimed(pool: String, claimed: Int, wxDust: Int, useRegularTransfer: Boolean) = {
-
-  if i.caller != this then throw("self call only") else
-
-  let rewards = calculateRewardsAndPrerareData(pool, claimed, 0)
-
-  func accounting( acc: List[IntegerEntry], t: ( String, ByteVector, Int ) ) =
-  {
-    let address = t._1
-    let assetId = t._2
-    let amount = t._3
-
-    if( amount == 0 ) then acc else
-    let key = if( assetId == wxAssetId ) then poolTotalWxClaimedKey( address ) else poolTotalSbtClaimedKey( address )
-    acc
+    update_user( msg.caller.toString(), -amount )
     ++
     [
-      IntegerEntry( key, getIntegerValue( key ) + amount )
+        ScriptTransfer( msg.caller, amount, asset( token ) )
     ]
-  }
-
-  let accountingActions = FOLD<4>( rewards, [], accounting )
-
-  func transferring( acc: List[ScriptTransfer], t: ( String, ByteVector, Int ) ) =
-  {
-    let address = t._1
-    let assetId = t._2
-    let amount = t._3
-
-    if( amount == 0 ) then acc else
-    if( useRegularTransfer ) then
-    {
-      acc ++ [ ScriptTransfer( addressFromStringValue( address ), amount, assetId ) ]
-    }
-    else
-    {
-      strict checkpoint = invoke( addressFromStringValue( address ), poolCheckpointFunctionName, [], [AttachedPayment( assetId, amount )] ) 
-      acc
-    }
-  }
-
-  let transferringActions = FOLD<4>( rewards, [], transferring )
-
-  transferringActions
-  ++
-  accountingActions
 }
 
+@Callable( msg )
+func claim() =
+{
+    if( size( msg.payments ) != 0 ) then throw( "wrong payments, should be empty" ) else
 
-# Вызывается пулом, когда он хочет склеймить накопившиеся награды
-# Также может вызвать кто угодно, указав адрес пула для клейма
-# Вызывает клейм у Waves Exchange, распределяет награды между пулами
-@Callable(i)
-func claimPoolRewards(pool: String) = {
-  let poolAddress = addressFromStringValue(pool)
-  let poolData = getPoolData(pool)
-  let poolLpToken = poolData._1
-  let wavesExchangePoolAddress = poolData._2
+    strict root_contract_claim = if root_contract == "" then [] else
+    invoke(getAddressOrAlias( root_contract ), "claimPoolRewards", [toBase58String(this.bytes)], [])
 
-  # Клеймим и расчитываем награды
-  strict currentWXOnContract = assetBalance(this, wxAssetId)
-  strict claimResult = invoke(wavesExchangePoolAddress, "claimWx", [poolLpToken], [])
-  let newWXOnContract = assetBalance(this, wxAssetId)
-  let claimed = newWXOnContract - currentWXOnContract
+    strict s = if( token_amount > 0 ) then sync() else []
 
-  if claimed == 0 then [] else
+    let user = msg.caller.toString()
+    func fold( acc: List[IntegerEntry|ScriptTransfer], asset: String ) =
+    {
+        acc
+        ++
+        {
+            let _asset_reward = asset_reward( asset )
 
-  let isPool = i.caller.bytes.toBase58String() == pool
-  strict distributeResult = invoke(this, "distributeClaimed", [pool, claimed, currentWXOnContract, isPool], [])
-  []
- }
+            let accumulated = user_asset_adjusted( user, asset ) + if( token_amount == 0 ) then 0 else fraction( _asset_reward, user_amount( user ), token_amount )
+            let claimed = user_asset_claimed( user, asset )
+            let amount = accumulated - claimed
+
+            if( amount == 0 ) then [] else
+            if( amount < 0 ) then throw( asset + " bad claim amount detected: " + amount.toString() ) else
+
+            let _asset_control = asset_control( asset )
+
+            [
+                ScriptTransfer( msg.caller, amount, asset( asset ) ),
+                IntegerEntry( user_asset_claimed_key( user, asset ), claimed + amount ),
+                IntegerEntry( asset_control_key( asset ), _asset_control - amount )
+            ]
+        }
+    }
+
+    let claim_actions = FOLD<5>( rewards_list, [], fold ) # MAX_REWARDS
+    if( size( claim_actions ) == 0 ) then throw( "nothing to claim" ) else
+    claim_actions
+}
+
+## INFO FUNCTIONS
+
+@Callable( msg )
+func claimable_tokens( user: String ) =
+{
+    ( [], user_amount( user ) )
+}
+
+@Callable( msg )
+func claimed_reward( user: String, asset: String ) =
+{
+    ( [], user_asset_claimed( user, asset ) )
+}
+
+@Callable( msg )
+func claimable_reward( user: String, asset: String ) =
+{
+    strict s = if( token_amount > 0 ) then sync() else []
+
+    let _asset_reward = asset_reward( asset )
+
+    let accumulated = user_asset_adjusted( user, asset ) + if( token_amount == 0 ) then 0 else fraction( _asset_reward, user_amount( user ), token_amount )
+    let claimed = user_asset_claimed( user, asset )
+    let amount = accumulated - claimed
+
+    ( [], amount )
+}
+
+@Callable( msg )
+func user_locked_readonly( user: String ) =
+{
+    let ( locked, start, finish ) = user_locked_values( user )
+    let speed = fraction( locked, locked_period, finish - start )
+    let unlocked = fraction( speed, HEIGHT - start, locked_period )
+    let available = min( [ unlocked, locked ] )
+    ( [], locked.toString() + "_" + available.toString() )
+}
+
+## SUPPORT FUNCTIONS
+
+@Callable( msg )
+func checkpoint() =
+{
+    if( is_killed ) then throw( "checkpoint is killed" ) else
+    if( token_amount == 0 && msg.caller != this ) then throw( "checkpoint unavailable" ) else
+    checkpoint_actions()
+}
+
+## ADMIN FUNCTIONS
+
+@Callable( msg )
+func init( _owner: String, _token: String, _rewards: String, _period: Int, _locked_period: Int, _twap: String, _root_contract: String ) =
+{
+    if( this.getString( "token" ).isDefined() ) then throw( "already initialized" ) else
+    if( msg.caller != this ) then throw( "self initialization only" ) else
+    if( _period <= 0 ) then throw( "bad period" ) else
+    if( _locked_period < 0 ) then throw( "bad locked_period" ) else
+
+    [
+        StringEntry( "owner", checkAddress( _owner ) ),
+        StringEntry( "token", checkAsset( _token ) ),
+        StringEntry( "rewards", checkRewardsList( _rewards, _token ) ),
+        IntegerEntry( "period", _period ),
+        IntegerEntry( "locked_period", _locked_period ),
+        StringEntry( "root_contract", if( _root_contract == "" ) then "" else checkAddressOrAlias( _root_contract ) ),
+        StringEntry( "twap", if( _twap == "" ) then "" else checkAddressOrAlias( _twap ) ),
+        BooleanEntry( "is_killed", false )
+    ]
+}
+
+@Callable( msg )
+func add_reward( reward: String ) =
+{
+    if( msg.caller != owner ) then throw( "only owner" ) else
+
+    [
+        StringEntry( "rewards", checkRewardsList( rewards + "," + reward, token ) )
+    ]
+}
+
+@Callable( msg )
+func set_killed( _is_killed: Boolean ) =
+{
+    if( msg.caller != owner ) then throw( "only owner" ) else
+    if( is_killed == _is_killed ) then throw( "same state" ) else
+
+    let stop_actions = if( _is_killed ) then stop_rewards() else []
+
+    [
+        BooleanEntry( "is_killed", _is_killed )
+    ]
+    ++
+    stop_actions
+}
+
+@Callable( msg )
+func claim_rewards_and_withdraw_all_tokens_from_root_contract() = {
+    if( msg.caller != owner ) then throw( "only owner" ) else
+    if( token_amount == 0 ) then throw( "nothing to claim" ) else
+
+    strict root_contract_withdrawal = if root_contract == "" then [] else
+    invoke(getAddressOrAlias( root_contract ), "withdrawPoolLps", [token_amount], [])
+
+    [StringEntry( "root_contract", "" )]
+}
+
+## DEVEL FUNCTIONS
+
+@Callable( msg )
+func set_height_address( _heightAddress: String ) =
+{
+    if( msg.caller != owner ) then throw( "only owner" ) else
+
+    [
+        StringEntry( "heightAddress", checkAddress( _heightAddress ) )
+    ]
+}
+
+## MAIN CONTRACT FUNCTIONS
+
+@Callable( msg )
+func invalidate_root_contract_connection() =
+{
+    if root_contract == "" then throw( "root contract is not set" ) else
+    if( msg.caller != getAddressOrAlias(root_contract) ) then throw( "only root contract" ) else
+
+    [
+        StringEntry( "root_contract", "" )
+    ]
+}
 
 ## VERIFIER FUNCTIONS
 
